@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+</head>
+<body>
+    <div class="card">
+        <div class="header {status_class}">
+            <h1 class="title">{status_icon} {status_text}</h1>
+        </div>
+        <div class="content">
+            <div class="file-name">{filename}</div>
+            <div class="conversion-flow">
+                <div class="track-box source">
+                    <div class="track-title">Исходная дорожка</div>
+                    <div class="track-info">
+                        <span class="channels">{src_channels}ch</span>
+                        <span class="codec">{src_codec}</span>
+                    </div>
+                </div>
+                <div class="arrow">→</div>
+                <div class="track-box target">
+                    <div class="track-title">Результат</div>
+                    <div class="track-info">
+                        <span class="channels">{tgt_channels}ch</span>
+                        <span class="codec">{tgt_codec}</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="footer">
+            <span class="timestamp">{timestamp}</span>
+        </div>
+    </div>
+</body>
+</html>

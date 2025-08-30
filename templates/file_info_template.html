@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+</head>
+<body>
+    <div class="card">
+        <div class="header">
+            <h1 class="title">{title}</h1>
+        </div>
+        <div class="content">
+            <div class="file-name">{filename}</div>
+            <div class="file-details">
+                <div class="detail">
+                    <span class="label">Размер:</span>
+                    <span class="value">{size}</span>
+                </div>
+                <div class="detail">
+                    <span class="label">Разрешение:</span>
+                    <span class="value">{resolution}</span>
+                </div>
+            </div>
+            <div class="audio-section">
+                <h3>🎵 Аудио дорожки</h3>
+                <div class="audio-tracks">
+                    {tracks_html}
+                </div>
+            </div>
+        </div>
+        <div class="footer">
+            <span class="timestamp">{timestamp}</span>
+        </div>
+    </div>
+</body>
+</html>

@@ -176,11 +176,18 @@ cython_debug/
 processed_files.json
 .audio_converter_state.json
 
-# Temporary files
+# Temporary files and generated images
 *.tmp
 *.temp
 *.converted.*
 *.stereo.*
+temp/
+temp/*.png
+temp/*.jpg
+temp/*.jpeg
+
+# Test files
+test_*.py
 
 # OS specific
 .DS_Store

@@ -18,6 +18,7 @@ from typing import Dict, List, Optional
 import signal
 from core.config_manager import ConfigManager
 from core.audio_monitor import AudioMonitor
+from core.logger import logger
 
 # Для Windows службы
 try:

@@ -143,6 +143,14 @@ class AudioMonitor:
         }
 
         try:
+            logger.info(f"Начинаем обработку: {file_path.name}")
+            
+            # Анализируем файл и отправляем уведомление о начале обработки
+            if self.notifier and self.config.getboolean('Telegram', 'notify_on_processing'):
+                file_info = await self.analyze_file_info(file_path)
+                message = f"🔄 Начинаем обработку файла"
+                await self.notifier.send_file_info_notification(file_info, message)
+            
             # Запускаем основной скрипт конвертации
             converter_script = self.config.get('General', 'converter_script', 'audio_converter.py')
             delete_flag = '--delete-original' if self.config.getboolean('General', 'delete_original') else ''
@@ -154,7 +162,7 @@ class AudioMonitor:
                 delete_flag
             ]))  # Убираем пустые элементы
 
-            logger.info(f"Обрабатываем: {file_path.name}")
+            logger.info(f"Запускаем конвертацию: {file_path.name}")
 
             process = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -168,19 +176,43 @@ class AudioMonitor:
                 result['status'] = 'success'
                 self.stats['converted'] += 1
 
-                # Отправляем уведомление
+                # Отправляем визуальное уведомление о успешной конвертации
                 if self.notifier and self.config.getboolean('Telegram', 'notify_on_conversion'):
-                    message = f"✅ <b>Файл конвертирован</b>\n\n📁 {file_path.name}"
-                    await self.notifier.send_message(message)
+                    conversion_info = {
+                        'status': 'success',
+                        'filename': file_path.name,
+                        'source_track': {
+                            'channels': 6,
+                            'language': 'eng',
+                            'codec': 'unknown'
+                        },
+                        'target_track': {
+                            'channels': 2,
+                            'language': 'eng',
+                            'codec': 'aac'
+                        },
+                        'duration': result.get('duration', 0),
+                        'output_size': file_path.stat().st_size if file_path.exists() else 0
+                    }
+                    await self.notifier.send_conversion_notification(conversion_info)
             else:
                 result['status'] = 'error'
                 result['error'] = stderr.decode('utf-8', errors='ignore')
                 self.stats['errors'] += 1
 
-                # Отправляем уведомление об ошибке
+                # Отправляем визуальное уведомление об ошибке
                 if self.notifier and self.config.getboolean('Telegram', 'notify_on_error'):
-                    message = f"❌ <b>Ошибка конвертации</b>\n\n📁 {file_path.name}\n\n{result['error'][:500]}"
-                    await self.notifier.send_message(message)
+                    conversion_info = {
+                        'status': 'error',
+                        'filename': file_path.name,
+                        'source_track': {
+                            'channels': 6,
+                            'language': 'eng',
+                            'codec': 'unknown'
+                        },
+                        'error': result['error'][:200]
+                    }
+                    await self.notifier.send_conversion_notification(conversion_info)
 
         except Exception as e:
             result['status'] = 'error'
@@ -194,6 +226,159 @@ class AudioMonitor:
         self.save_processed_files()
 
         return result
+
+    async def analyze_file_info(self, file_path: Path) -> Dict:
+        """Анализ информации о файле для уведомления"""
+        try:
+            import subprocess
+            import json
+            
+            # Используем ffprobe для получения информации о файле
+            cmd = [
+                'ffprobe',
+                '-v', 'quiet',
+                '-print_format', 'json',
+                '-show_format',
+                '-show_streams',
+                str(file_path)
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            
+            if result.returncode != 0:
+                logger.warning(f"Не удалось проанализировать файл {file_path.name}")
+                return self._get_basic_file_info(file_path)
+            
+            data = json.loads(result.stdout)
+            
+            # Извлекаем информацию о файле
+            file_info = {
+                'name': file_path.name,
+                'size': file_path.stat().st_size,
+                'audio_tracks': []
+            }
+            
+            # Получаем информацию о формате
+            format_info = data.get('format', {})
+            if 'duration' in format_info:
+                file_info['duration'] = float(format_info['duration'])
+            
+            # Анализируем потоки
+            for stream in data.get('streams', []):
+                if stream.get('codec_type') == 'video':
+                    # Информация о видео
+                    width = stream.get('width')
+                    height = stream.get('height')
+                    if width and height:
+                        file_info['resolution'] = f"{width}x{height}"
+                
+                elif stream.get('codec_type') == 'audio':
+                    # Информация об аудио дорожках
+                    track = {
+                        'index': stream.get('index', 0),
+                        'codec': stream.get('codec_name', 'unknown'),
+                        'channels': stream.get('channels', 0),
+                        'language': 'unknown'
+                    }
+                    
+                    # Извлекаем язык из тегов
+                    tags = stream.get('tags', {})
+                    for key, value in tags.items():
+                        if key.lower() in ['language', 'lang']:
+                            track['language'] = value.lower()
+                            break
+                    
+                    # Если язык не найден, пробуем другие поля
+                    if track['language'] == 'unknown':
+                        title = tags.get('title', '').lower()
+                        if 'english' in title or 'eng' in title:
+                            track['language'] = 'eng'
+                        elif 'russian' in title or 'rus' in title:
+                            track['language'] = 'rus'
+                    
+                    file_info['audio_tracks'].append(track)
+            
+            return file_info
+            
+        except Exception as e:
+            logger.error(f"Ошибка анализа файла {file_path.name}: {e}")
+            return self._get_basic_file_info(file_path)
+    
+    def _get_basic_file_info(self, file_path: Path) -> Dict:
+        """Получение базовой информации о файле без ffprobe"""
+        return {
+            'name': file_path.name,
+            'size': file_path.stat().st_size,
+            'audio_tracks': [
+                {'channels': 6, 'language': 'unknown', 'codec': 'unknown'}
+            ]
+        }
+
+    async def send_startup_notification(self, watch_dir: Path, check_interval: int):
+        """Отправка визуального уведомления о запуске с информацией о директории"""
+        try:
+            # Сканируем директорию для получения актуальной информации
+            all_files = []
+            extensions = self.config.get('FileTypes', 'extensions', '.mp4,.mkv').split(',')
+            min_size_mb = self.config.getint('Advanced', 'min_file_size_mb', 100)
+            min_size_bytes = min_size_mb * 1024 * 1024
+            
+            def scan_for_startup(path: Path, depth: int = 0):
+                max_depth = self.config.getint('General', 'max_depth', 2)
+                if depth > max_depth:
+                    return
+                
+                try:
+                    for item in path.iterdir():
+                        if item.is_dir():
+                            scan_for_startup(item, depth + 1)
+                        elif item.is_file():
+                            if (item.suffix.lower() in extensions and 
+                                item.stat().st_size >= min_size_bytes):
+                                
+                                # Определяем статус файла
+                                if str(item) in self.processed_files:
+                                    status = 'processed'
+                                else:
+                                    status = 'pending'
+                                
+                                all_files.append({
+                                    'name': item.name,
+                                    'status': status,
+                                    'size': item.stat().st_size
+                                })
+                except (PermissionError, OSError):
+                    pass
+            
+            scan_for_startup(watch_dir)
+            
+            # Подсчитываем статистику
+            processed_count = len([f for f in all_files if f['status'] == 'processed'])
+            pending_count = len([f for f in all_files if f['status'] == 'pending'])
+            
+            # Подготавливаем данные для визуальной карточки
+            startup_info = {
+                'stats': {
+                    'total_files': len(all_files),
+                    'processed_files': processed_count,
+                    'pending_files': pending_count,
+                    'error_files': self.stats.get('errors', 0)
+                },
+                'recent_files': all_files[:8],  # Показываем первые 8 файлов
+                'directory': str(watch_dir),
+                'interval': check_interval,
+                'startup': True
+            }
+            
+            # Отправляем визуальную карточку
+            message = f"🚀 Мониторинг запущен\n📁 {watch_dir}\n⏱ Интервал: {check_interval}с"
+            await self.notifier.send_directory_summary_notification(startup_info, message)
+            
+        except Exception as e:
+            logger.error(f"Ошибка отправки уведомления о запуске: {e}")
+            # Fallback к простому текстовому сообщению
+            message = f"🚀 <b>Мониторинг запущен</b>\n\n📁 Директория: {watch_dir}\n⏱ Интервал: {check_interval}с"
+            await self.notifier.send_message(message)
 
     async def monitor_loop(self):
         """Основной цикл мониторинга"""
@@ -221,10 +406,9 @@ class AudioMonitor:
         logger.info(f"Начинаем мониторинг: {watch_dir}")
         logger.info(f"Интервал проверки: {check_interval} секунд")
 
-        # Отправляем уведомление о запуске
+        # Отправляем визуальное уведомление о запуске с состоянием директории
         if self.notifier and self.config.getboolean('Telegram', 'notify_on_start'):
-            message = f"🚀 <b>Мониторинг запущен</b>\n\n📁 Директория: {watch_dir}\n⏱ Интервал: {check_interval}с"
-            await self.notifier.send_message(message)
+            await self.send_startup_notification(watch_dir, check_interval)
 
         self.running = True
         last_summary_time = datetime.now()
@@ -275,20 +459,26 @@ class AudioMonitor:
                     await asyncio.sleep(1)
 
     async def send_summary(self):
-        """Отправка сводки в Telegram"""
+        """Отправка визуальной сводки в Telegram"""
         if not self.notifier:
             return
 
-        message = f"""📊 <b>Статистика работы</b>
+        # Подготавливаем данные для визуальной сводки
+        summary_info = {
+            'stats': {
+                'total_files': self.stats['total_processed'],
+                'processed_files': self.stats['converted'],
+                'pending_files': 0,  # В текущей реализации мы не отслеживаем ожидающие файлы
+                'error_files': self.stats['errors']
+            },
+            'recent_files': []  # Можно добавить последние обработанные файлы
+        }
 
-📁 Обработано файлов: {self.stats['total_processed']}
-✅ Конвертировано: {self.stats['converted']}
-⚠️ Без английских дорожек: {self.stats['no_english']}
-❌ Ошибок: {self.stats['errors']}
-
-⏰ Время: {datetime.now().strftime('%Y-%m-%d %H:%M')}"""
-
-        await self.notifier.send_message(message)
+        # Отправляем визуальную сводку
+        await self.notifier.send_directory_summary_notification(summary_info)
+        
+        # Очищаем временные файлы
+        self.notifier.cleanup_temp_files()
 
     def stop(self):
         """Остановка мониторинга"""

@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+</head>
+<body>
+    <div class="card summary">
+        <div class="header">
+            <h1 class="title">{title}</h1>
+        </div>
+        <div class="content">
+            {startup_info}
+            <div class="stats-grid">
+                <div class="stat-item">
+                    <div class="stat-number">{total_files}</div>
+                    <div class="stat-label">Всего файлов</div>
+                </div>
+                <div class="stat-item success">
+                    <div class="stat-number">{processed_files}</div>
+                    <div class="stat-label">Обработано</div>
+                </div>
+                <div class="stat-item warning">
+                    <div class="stat-number">{pending_files}</div>
+                    <div class="stat-label">Ожидает</div>
+                </div>
+                <div class="stat-item error">
+                    <div class="stat-number">{error_files}</div>
+                    <div class="stat-label">Ошибок</div>
+                </div>
+            </div>
+            <div class="files-section">
+                <h3>{files_title}</h3>
+                <div class="files-list">
+                    {files_html}
+                </div>
+            </div>
+        </div>
+        <div class="footer">
+            <span class="timestamp">{timestamp}</span>
+        </div>
+    </div>
+</body>
+</html>
