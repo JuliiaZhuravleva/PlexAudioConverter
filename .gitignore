@@ -200,3 +200,4 @@ Thumbs.db
 
 # Config files with sensitive data
 monitor_config.ini
+.claude/settings.local.json
