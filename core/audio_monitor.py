@@ -9,6 +9,7 @@ from .logger import logger
 from .telegram_notifier import TelegramNotifier
 from .config_manager import ConfigManager
 from .download_monitor import DownloadMonitor, DownloadStatus, FileDownloadInfo
+from .video_integrity_checker import VideoIntegrityChecker, VideoIntegrityStatus
 
 class AudioMonitor:
     """Основной класс мониторинга"""
@@ -30,6 +31,9 @@ class AudioMonitor:
             stability_threshold=config.getfloat('Download', 'stability_threshold', 30.0)
         )
         self.download_monitor.add_callback(self._on_download_status_change)
+        
+        # Инициализация проверки целостности видео
+        self.integrity_checker = VideoIntegrityChecker()
 
         # Инициализация Telegram
         if self.config.getboolean('Telegram', 'enabled'):
@@ -91,6 +95,11 @@ class AudioMonitor:
                             logger.debug(f"Пропускаем файл (неподходящее расширение): {item.name}")
                             continue
 
+                        # Пропускаем уже конвертированные файлы (.stereo, .converted)
+                        if any(item.stem.endswith(suffix) for suffix in ['.stereo', '.converted']):
+                            logger.debug(f"Пропускаем конвертированный файл: {item.name}")
+                            continue
+
                         # Проверяем размер
                         file_size_mb = item.stat().st_size / (1024 * 1024)
                         if item.stat().st_size < min_size_bytes:
@@ -115,8 +124,16 @@ class AudioMonitor:
                             
                             # Проверяем завершена ли загрузка
                             if download_info.status == DownloadStatus.COMPLETED:
-                                logger.info(f"Найден новый файл для обработки: {item.name} ({file_size_mb:.1f} МБ)")
-                                new_files.append(item)
+                                # Дополнительная проверка целостности файла
+                                integrity_status = self.integrity_checker.check_integrity(item)
+                                if integrity_status == VideoIntegrityStatus.COMPLETE:
+                                    logger.info(f"Найден новый файл для обработки: {item.name} ({file_size_mb:.1f} МБ) - целостность подтверждена")
+                                    new_files.append(item)
+                                else:
+                                    logger.warning(f"Файл {item.name} помечен как загруженный, но проверка целостности показала: {integrity_status.value}")
+                                    # Возвращаем файл в статус загрузки
+                                    download_info.status = DownloadStatus.DOWNLOADING
+                                    download_info.detection_method = f"integrity_check_failed: {integrity_status.value}"
                             elif download_info.status == DownloadStatus.DOWNLOADING:
                                 logger.info(f"Файл еще загружается: {item.name} ({download_info.detection_method})")
                             else:
@@ -433,6 +450,7 @@ class AudioMonitor:
         watch_dir = Path(watch_dir_abs)
         logger.info(f"Начинаем мониторинг: {watch_dir}")
         logger.info(f"Интервал проверки: {check_interval} секунд")
+
 
         # Отправляем визуальное уведомление о запуске с состоянием директории
         if self.notifier and self.config.getboolean('Telegram', 'notify_on_start'):
