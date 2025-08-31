@@ -22,7 +22,7 @@ body {
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
     overflow: hidden;
     width: 100%;
-    max-width: 560px;
+    max-width: 760px;
 }
 
 .header {
@@ -300,4 +300,36 @@ body {
 .timestamp {
     font-size: 11px;
     color: #9399b2;
+}
+
+/* === Telegram render overrides === */
+html, body {
+    background: transparent !important;   /* ни градиента, ни фона */
+    margin: 0 !important;
+    padding: 0 !important;
+    min-height: 0 !important;
+    display: block !important;            /* убираем центрирующий flex на body */
+    align-items: initial !important;
+    justify-content: initial !important;
+    width: max-content !important;        /* размер равен содержимому */
+    height: max-content !important;
+}  
+
+/* Убираем внешние тени */
+.card,
+.header,
+.content,
+.footer {
+  box-shadow: none !important;
+  filter: none !important;
+}
+
+/* Гарантируем сплошной фон */
+html, body {
+  background: transparent !important;
+}
+
+.card {
+  background: #313244 !important; /* ровный фон */
+  border: 1px solid rgba(0,0,0,0.25); /* мягкая рамка вместо размытой тени */
 }

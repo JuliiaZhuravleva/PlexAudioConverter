@@ -22,7 +22,7 @@ class TelegramNotifier:
         self.bot = None
         
         # Используем HTML генератор
-        self.html_generator = HtmlVisualGenerator(temp_dir="temp")
+        self.html_generator = HtmlVisualGenerator(do_trim=True)
 
         if TELEGRAM_AVAILABLE:
             try:
