@@ -8,6 +8,7 @@ from typing import Dict, List
 from .logger import logger
 from .telegram_notifier import TelegramNotifier
 from .config_manager import ConfigManager
+from .download_monitor import DownloadMonitor, DownloadStatus, FileDownloadInfo
 
 class AudioMonitor:
     """Основной класс мониторинга"""
@@ -23,6 +24,12 @@ class AudioMonitor:
             'errors': 0,
             'no_english': 0
         }
+        
+        # Инициализация мониторинга загрузок
+        self.download_monitor = DownloadMonitor(
+            stability_threshold=config.getfloat('Download', 'stability_threshold', 30.0)
+        )
+        self.download_monitor.add_callback(self._on_download_status_change)
 
         # Инициализация Telegram
         if self.config.getboolean('Telegram', 'enabled'):
@@ -36,6 +43,11 @@ class AudioMonitor:
 
         # Загрузка истории обработанных файлов
         self.load_processed_files()
+        
+        # Запуск мониторинга загрузок
+        if config.getboolean('Download', 'enabled', True):
+            check_interval = config.getfloat('Download', 'check_interval', 5.0)
+            self.download_monitor.start_monitoring(check_interval)
 
     def find_new_files(self, directory: Path) -> List[Path]:
         """Поиск новых видеофайлов"""
@@ -94,8 +106,21 @@ class AudioMonitor:
 
                         # Проверяем, не обработан ли файл ранее
                         if str(item) not in self.processed_files:
-                            logger.info(f"Найден новый файл для обработки: {item.name} ({file_size_mb:.1f} МБ)")
-                            new_files.append(item)
+                            # Проверяем статус загрузки файла
+                            download_info = self.download_monitor.get_file_status(item)
+                            if download_info is None:
+                                # Добавляем файл в мониторинг загрузок
+                                download_info = self.download_monitor.add_file(item, is_torrent_file=True)
+                                logger.info(f"Добавлен в мониторинг загрузок: {item.name}")
+                            
+                            # Проверяем завершена ли загрузка
+                            if download_info.status == DownloadStatus.COMPLETED:
+                                logger.info(f"Найден новый файл для обработки: {item.name} ({file_size_mb:.1f} МБ)")
+                                new_files.append(item)
+                            elif download_info.status == DownloadStatus.DOWNLOADING:
+                                logger.info(f"Файл еще загружается: {item.name} ({download_info.detection_method})")
+                            else:
+                                logger.debug(f"Файл в статусе {download_info.status.value}: {item.name}")
                         else:
                             logger.debug(f"Файл уже обработан: {item.name}")
             except PermissionError:
@@ -225,6 +250,9 @@ class AudioMonitor:
         self.stats['total_processed'] += 1
         self.save_processed_files()
 
+        # Удаляем файл из мониторинга загрузок после обработки
+        self.download_monitor.remove_file(file_path)
+        
         return result
 
     async def analyze_file_info(self, file_path: Path) -> Dict:
@@ -418,6 +446,9 @@ class AudioMonitor:
             try:
                 current_time = datetime.now()
                 
+                # Отправляем отложенные уведомления о завершении загрузок
+                await self._send_pending_download_notifications()
+                
                 # Проверяем, пора ли сканировать файлы
                 if (current_time - last_check_time).total_seconds() >= check_interval:
                     # Ищем новые файлы
@@ -480,7 +511,98 @@ class AudioMonitor:
         # Очищаем временные файлы
         self.notifier.cleanup_temp_files()
 
+    def _on_download_status_change(self, file_info: FileDownloadInfo):
+        """Обработчик изменения статуса загрузки файла"""
+        try:
+            if file_info.status == DownloadStatus.COMPLETED:
+                logger.info(f"Загрузка завершена: {file_info.file_path.name}")
+                
+                # Отправляем уведомление о завершении загрузки
+                if self.notifier and self.config.getboolean('Download', 'notify_on_complete', True):
+                    self._schedule_download_notification(file_info)
+                    
+            elif file_info.status == DownloadStatus.DOWNLOADING:
+                logger.debug(f"Файл загружается: {file_info.file_path.name} ({file_info.detection_method})")
+                
+        except Exception as e:
+            logger.error(f"Ошибка в обработчике статуса загрузки: {e}")
+    
+    def _schedule_download_notification(self, file_info: FileDownloadInfo):
+        """Планирование уведомления о завершении загрузки"""
+        try:
+            # Проверяем, есть ли активный event loop
+            try:
+                loop = asyncio.get_running_loop()
+                # Если loop есть, создаем задачу
+                loop.create_task(self._send_download_complete_notification(file_info))
+            except RuntimeError:
+                # Нет активного loop - сохраняем для отправки позже
+                if not hasattr(self, '_pending_download_notifications'):
+                    self._pending_download_notifications = []
+                self._pending_download_notifications.append(file_info)
+                logger.debug(f"Уведомление о завершении загрузки отложено: {file_info.file_path.name}")
+                
+        except Exception as e:
+            logger.error(f"Ошибка планирования уведомления: {e}")
+    
+    async def _send_download_complete_notification(self, file_info: FileDownloadInfo):
+        """Отправка уведомления о завершении загрузки"""
+        try:
+            file_size_mb = file_info.size / (1024 * 1024)
+            message = f"📥 <b>Загрузка завершена</b>\n\n📁 {file_info.file_path.name}\n📊 {file_size_mb:.1f} МБ"
+            
+            # Получаем информацию о файле для визуальной карточки
+            file_analysis = await self.analyze_file_info(file_info.file_path)
+            await self.notifier.send_file_info_notification(file_analysis, message)
+            
+        except Exception as e:
+            logger.error(f"Ошибка отправки уведомления о завершении загрузки: {e}")
+    
+    def get_download_status_summary(self) -> Dict:
+        """Получение сводки по статусам загрузок"""
+        downloading_files = self.download_monitor.get_downloading_files()
+        completed_files = self.download_monitor.get_completed_files()
+        
+        return {
+            'downloading_count': len(downloading_files),
+            'completed_count': len(completed_files),
+            'downloading_files': [{
+                'name': info.file_path.name,
+                'size_mb': info.size / (1024 * 1024) if info.size > 0 else 0,
+                'detection_method': info.detection_method,
+                'stable_duration': info.stable_duration
+            } for info in downloading_files[:5]],  # Показываем только первые 5
+            'completed_files': [{
+                'name': info.file_path.name,
+                'size_mb': info.size / (1024 * 1024) if info.size > 0 else 0
+            } for info in completed_files[-5:]]  # Показываем последние 5
+        }
+    
     def stop(self):
         """Остановка мониторинга"""
         logger.info("Останавливаем мониторинг...")
         self.running = False
+        
+        # Останавливаем мониторинг загрузок
+        if hasattr(self, 'download_monitor'):
+            self.download_monitor.stop_monitoring()
+    
+    async def _send_pending_download_notifications(self):
+        """Отправка отложенных уведомлений о завершении загрузок"""
+        if not hasattr(self, '_pending_download_notifications') or not self._pending_download_notifications:
+            return
+            
+        try:
+            # Отправляем все отложенные уведомления
+            notifications_to_send = self._pending_download_notifications.copy()
+            self._pending_download_notifications.clear()
+            
+            for file_info in notifications_to_send:
+                try:
+                    await self._send_download_complete_notification(file_info)
+                    logger.debug(f"Отправлено отложенное уведомление: {file_info.file_path.name}")
+                except Exception as e:
+                    logger.error(f"Ошибка отправки отложенного уведомления: {e}")
+                    
+        except Exception as e:
+            logger.error(f"Ошибка обработки отложенных уведомлений: {e}")
