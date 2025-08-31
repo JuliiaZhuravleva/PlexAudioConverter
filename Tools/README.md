@@ -319,7 +319,7 @@ for report_file in Path('.').glob('**/*.quality_report.json'):
 ## 📚 Полезные ссылки
 
 - [EBU R128 стандарт](https://tech.ebu.ch/docs/r/r128.pdf)
-- [LUFS объяснение](https://www.masteringthemix.com/blogs/learn/76296773-what-is-lufs-and-why-should-i-care)
+- [LUFS объяснение](https://www.masteringthemix.com/blogs/learn/76296773-mastering-audio-for-soundcloud-itunes-spotify-and-youtube)
 - [Частоты человеческого голоса](https://www.dpamicrophones.com/mic-university/facts-about-speech-intelligibility)
 
 ---
