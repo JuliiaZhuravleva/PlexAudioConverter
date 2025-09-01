@@ -187,7 +187,7 @@ temp/*.jpg
 temp/*.jpeg
 
 # Test files
-test_*.py
+# test_*.py
 
 # OS specific
 .DS_Store
