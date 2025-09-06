@@ -81,16 +81,19 @@ class StateStore:
         Args:
             db_path: путь к файлу базы данных
         """
-        self.db_path = Path(db_path)
+        self.db_path_str = str(db_path)
+        self.db_path = Path(db_path) if db_path != ":memory:" else None
         self._lock = threading.RLock()
+        self._memory_conn = None  # Persistent connection for :memory: databases
         
-        # Создаем директорию если нужно
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        # Создаем директорию если нужно (только для файловых БД)
+        if self.db_path:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
         
         # Инициализируем БД
         self._init_database()
         
-        logger.info(f"StateStore инициализирован: {self.db_path}")
+        logger.info(f"StateStore инициализирован: {self.db_path_str}")
 
     def _init_database(self):
         """Инициализация структуры БД"""
@@ -109,16 +112,28 @@ class StateStore:
     def _get_connection(self):
         """Получение подключения к БД с блокировкой"""
         with self._lock:
-            conn = sqlite3.connect(
-                self.db_path,
-                timeout=30.0,
-                check_same_thread=False
-            )
-            conn.row_factory = sqlite3.Row
-            try:
-                yield conn
-            finally:
-                conn.close()
+            if self.db_path_str == ":memory:":
+                # For in-memory databases, reuse the same connection
+                if self._memory_conn is None:
+                    self._memory_conn = sqlite3.connect(
+                        self.db_path_str,
+                        timeout=30.0,
+                        check_same_thread=False
+                    )
+                    self._memory_conn.row_factory = sqlite3.Row
+                yield self._memory_conn
+            else:
+                # For file databases, create new connections each time
+                conn = sqlite3.connect(
+                    self.db_path_str,
+                    timeout=30.0,
+                    check_same_thread=False
+                )
+                conn.row_factory = sqlite3.Row
+                try:
+                    yield conn
+                finally:
+                    conn.close()
 
     def _row_to_file_entry(self, row: sqlite3.Row) -> FileEntry:
         """Преобразование строки БД в FileEntry"""
@@ -283,7 +298,8 @@ class StateStore:
         with self._get_connection() as conn:
             cursor = conn.execute("""
                 SELECT * FROM files 
-                WHERE next_check_at <= ?
+                WHERE next_check_at <= ? 
+                AND integrity_status != 'PENDING'
                 ORDER BY next_check_at ASC
                 LIMIT ?
             """, (current_time, limit))
@@ -580,11 +596,15 @@ class StateStore:
     def backup_database(self, backup_path: Union[str, Path]) -> bool:
         """Создание резервной копии БД"""
         try:
+            if self.db_path_str == ":memory:":
+                logger.warning("Нельзя создать резервную копию in-memory базы данных")
+                return False
+            
             import shutil
             backup_path = Path(backup_path)
             backup_path.parent.mkdir(parents=True, exist_ok=True)
             
-            shutil.copy2(self.db_path, backup_path)
+            shutil.copy2(self.db_path_str, backup_path)
             logger.info(f"Резервная копия создана: {backup_path}")
             return True
         except Exception as e:
@@ -606,4 +626,7 @@ class StateStore:
 
     def close(self):
         """Закрытие хранилища"""
+        if self._memory_conn:
+            self._memory_conn.close()
+            self._memory_conn = None
         logger.info("StateStore закрыт")

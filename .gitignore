@@ -51,6 +51,15 @@ coverage.xml
 .pytest_cache/
 cover/
 
+# Test results and artifacts
+test_results/
+test-results-*/
+coverage-html-*/
+*.junit.xml
+*_junit.xml
+*_report.json
+*_coverage.json
+
 # Translations
 *.mo
 *.pot
@@ -176,6 +185,13 @@ cython_debug/
 processed_files.json
 .audio_converter_state.json
 
+# State management databases
+state.db
+dev_state.db
+test_state.db
+*.db-wal
+*.db-shm
+
 # Temporary files and generated images
 *.tmp
 *.temp
@@ -186,8 +202,10 @@ temp/*.png
 temp/*.jpg
 temp/*.jpeg
 
-# Test files
-# test_*.py
+# Test files and temporary test data
+test_*.db
+*_test.db
+plex_test_*/
 
 # OS specific
 .DS_Store
