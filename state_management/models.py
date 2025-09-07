@@ -15,6 +15,7 @@ from .enums import (
     GroupProcessedStatus, validate_integrity_transition, 
     validate_processed_transition, validate_pair_transition
 )
+from .time_provider import TimeSource, get_time_source
 
 
 @dataclass
@@ -29,10 +30,14 @@ class FileEntry:
     
     # Метаданные файла
     size_bytes: int = 0
-    mtime: int = 0  # epoch seconds
+    mtime: int = 0  # epoch seconds (wall time)
     first_seen_at: int = field(default_factory=lambda: int(datetime.now().timestamp()))
-    stable_since: Optional[int] = None  # время, с которого размер не менялся
+    stable_since: Optional[int] = None  # время, с которого размер не менялся (wall time, legacy)
     next_check_at: int = field(default_factory=lambda: int(datetime.now().timestamp()))
+    
+    # Monotonic time fields for deterministic stability decisions
+    last_change_at: Optional[float] = None  # monotonic time of last size/mtime change
+    stable_since_mono: Optional[float] = None  # monotonic time when stability was armed
     
     # Статусы и результаты проверок
     integrity_status: IntegrityStatus = IntegrityStatus.UNKNOWN
@@ -126,19 +131,34 @@ class FileEntry:
         return True
 
     def update_file_stats(self, size_bytes: int, mtime: int, 
-                         stable_threshold_sec: int = 30) -> bool:
+                         stable_threshold_sec: int = 30, 
+                         time_source: TimeSource = None) -> bool:
         """
-        Обновляет статистику файла (размер, время модификации)
+        Обновляет статистику файла (размер, время модификации) с использованием monotonic time
         Возвращает True если файл изменился
+        
+        Args:
+            size_bytes: новый размер файла
+            mtime: новое время модификации файла (wall time)
+            stable_threshold_sec: порог стабильности в секундах
+            time_source: источник времени (по умолчанию - глобальный)
         """
+        if time_source is None:
+            time_source = get_time_source()
+        
         changed = False
-        now = int(datetime.now().timestamp())
+        now_wall = time_source.now_wall()
+        now_mono = time_source.now_mono()
         
         if self.size_bytes != size_bytes or self.mtime != mtime:
+            # Файл изменился - полный сброс состояния
             self.size_bytes = size_bytes
             self.mtime = mtime
-            # Полный сброс всех статусов - файл изменился, начинаем заново
+            self.last_change_at = now_mono
+            
+            # Сброс всех статусов stability и integrity
             self.stable_since = None
+            self.stable_since_mono = None
             self.integrity_status = IntegrityStatus.UNKNOWN
             self.integrity_score = None
             self.integrity_mode_used = None
@@ -146,15 +166,17 @@ class FileEntry:
             self.processed_status = ProcessedStatus.NEW
             self.has_en2 = None
             self.last_error = None
-            self.next_check_at = now + 1  # проверим через секунду
-            self.updated_at = now
+            
+            # Короткая задержка перед следующей проверкой
+            self.next_check_at = int(now_wall + 2)  # проверим через 2 секунды
+            self.updated_at = int(now_wall)
             changed = True
-        elif self.stable_since is None and (now - mtime >= stable_threshold_sec):
-            # Файл не менялся достаточно долго - считаем стабильным
-            self.stable_since = mtime  # устанавливаем момент последней модификации
-            self.next_check_at = now  # можно проверять целостность
-            self.updated_at = now
-        
+            
+        elif self.last_change_at is None:
+            # Миграция: устанавливаем last_change_at для существующих записей
+            self.last_change_at = now_mono
+            self.updated_at = int(now_wall)
+            
         return changed
 
     def is_due_for_check(self, current_time: Optional[int] = None) -> bool:
@@ -162,6 +184,20 @@ class FileEntry:
         if current_time is None:
             current_time = int(datetime.now().timestamp())
         return self.next_check_at <= current_time
+    
+    def is_quarantined(self, current_time: Optional[int] = None) -> bool:
+        """
+        Находится ли файл в карантине (quarantine state)
+        
+        Карантин = integrity_status в {INCOMPLETE, ERROR} И будущий next_check_at
+        """
+        if current_time is None:
+            current_time = int(datetime.now().timestamp())
+        
+        return (
+            self.integrity_status in {IntegrityStatus.INCOMPLETE, IntegrityStatus.ERROR} and 
+            self.next_check_at > current_time
+        )
 
     def schedule_next_check(self, delay_seconds: int):
         """Планирует следующую проверку через delay_seconds"""
@@ -170,11 +206,72 @@ class FileEntry:
         self.updated_at = now
 
     def is_stable(self, min_stable_sec: int = 30) -> bool:
-        """Является ли файл стабильным (не меняется достаточно долго)"""
+        """Является ли файл стабильным (не меняется достаточно долго) - legacy wall time"""
         if self.stable_since is None:
             return False
         now = int(datetime.now().timestamp())
         return (now - self.stable_since) >= min_stable_sec
+    
+    def is_stable_mono(self, min_stable_sec: int = 30, time_source: TimeSource = None) -> bool:
+        """Является ли файл стабильным по monotonic time (предпочтительный метод)"""
+        if time_source is None:
+            time_source = get_time_source()
+        
+        if self.stable_since_mono is None:
+            return False
+        
+        now_mono = time_source.now_mono()
+        return (now_mono - self.stable_since_mono) >= min_stable_sec
+    
+    def arm_stability(self, time_source: TimeSource = None) -> bool:
+        """
+        Проверить и активировать стабильность если файл достаточно долго не менялся
+        
+        Returns:
+            True если стабильность была активирована в этом вызове
+        """
+        if time_source is None:
+            time_source = get_time_source()
+        
+        now_mono = time_source.now_mono()
+        
+        # Уже стабилен
+        if self.stable_since_mono is not None:
+            return False
+        
+        # Нет информации о последнем изменении
+        if self.last_change_at is None:
+            return False
+        
+        # Проверяем, прошла ли секунда с последнего изменения (минимальная задержка)
+        if (now_mono - self.last_change_at) >= 1.0:
+            self.stable_since_mono = now_mono
+            self.updated_at = int(time_source.now_wall())
+            return True
+        
+        return False
+    
+    def get_stability_due_time(self, stable_wait_sec: int, time_source: TimeSource = None) -> float:
+        """
+        Получить wall time когда файл будет готов к integrity проверке
+        
+        Returns:
+            Wall time timestamp когда файл станет готов, или 0.0 если уже готов
+        """
+        if time_source is None:
+            time_source = get_time_source()
+        
+        if self.stable_since_mono is None:
+            # Еще не стабилен
+            return time_source.now_wall() + stable_wait_sec
+        
+        elapsed_stable = time_source.now_mono() - self.stable_since_mono
+        remaining = stable_wait_sec - elapsed_stable
+        
+        if remaining <= 0:
+            return 0.0  # Уже готов
+        
+        return time_source.now_wall() + remaining
 
     def to_dict(self) -> Dict[str, Any]:
         """Преобразование в словарь для сериализации"""

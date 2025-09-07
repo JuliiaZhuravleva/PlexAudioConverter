@@ -17,6 +17,7 @@ from .store import StateStore
 from .models import FileEntry, GroupEntry, create_file_entry_from_path, normalize_group_id
 from .enums import IntegrityStatus, ProcessedStatus, PairStatus, IntegrityMode
 from .metrics import get_metrics, MetricNames
+from .time_provider import TimeSource, StatProvider, get_time_source, get_stat_provider
 
 logger = logging.getLogger(__name__)
 
@@ -50,15 +51,21 @@ class PlannerTask:
 class StatePlanner:
     """Планировщик для управления жизненным циклом файлов"""
 
-    def __init__(self, state_store: StateStore, config: Dict[str, Any] = None):
+    def __init__(self, state_store: StateStore, config: Dict[str, Any] = None, 
+                 time_source: TimeSource = None, stat_provider: StatProvider = None):
         """
         Инициализация планировщика
         
         Args:
             state_store: хранилище состояний
             config: конфигурация планировщика
+            time_source: источник времени (по умолчанию - системный)
+            stat_provider: провайдер статистики файлов (по умолчанию - системный)
         """
         self.store = state_store
+        self.time_source = time_source or get_time_source()
+        self.stat_provider = stat_provider or get_stat_provider()
+        
         self.config = {
             'stable_wait_sec': 30,
             'backoff_step_sec': 30,
@@ -91,7 +98,7 @@ class StatePlanner:
 
     async def discover_file(self, file_path: Path, delete_original: bool = False) -> FileEntry:
         """
-        Обнаружение нового файла и добавление в систему
+        Обнаружение нового файла и добавление в систему с использованием StatProvider
         
         Args:
             file_path: путь к файлу
@@ -101,24 +108,34 @@ class StatePlanner:
             Созданный или обновленный FileEntry
         """
         try:
+            # Проверяем существование через StatProvider
+            if not self.stat_provider.exists(file_path):
+                logger.warning(f"Файл не существует: {file_path}")
+                raise FileNotFoundError(f"File does not exist: {file_path}")
+            
+            # Получаем статистику через StatProvider
+            file_stats = self.stat_provider.stat(file_path)
+            
             # Проверяем, существует ли файл в хранилище
             existing = self.store.get_file(file_path)
             
             if existing is None:
                 # Создаем новую запись
                 entry = create_file_entry_from_path(file_path, delete_original)
-                entry.next_check_at = int(datetime.now().timestamp())  # проверить сразу
+                # Инициализируем monotonic time для нового файла
+                entry.last_change_at = self.time_source.now_mono()
+                entry.next_check_at = int(self.time_source.now_wall()) + 2  # проверить через 2 секунды
                 entry = self.store.upsert_file(entry)
                 
                 logger.info(f"Обнаружен новый файл: {file_path.name} (ID: {entry.id})")
             else:
-                # Обновляем существующую запись
-                stat = file_path.stat()
+                # Обновляем существующую запись с новой статистикой
                 entry = existing
                 changed = entry.update_file_stats(
-                    stat.st_size, 
-                    int(stat.st_mtime),
-                    self.config['stable_wait_sec']
+                    file_stats.size, 
+                    file_stats.mtime,
+                    self.config['stable_wait_sec'],
+                    self.time_source
                 )
                 
                 if changed:
@@ -278,22 +295,64 @@ class StatePlanner:
             return False
 
     async def _handle_size_stability(self, entry: FileEntry) -> bool:
-        """Обработка проверки стабильности размера"""
+        """Обработка проверки стабильности размера с использованием monotonic time"""
         file_path = Path(entry.path)
         
-        if not file_path.exists():
+        # Проверяем существование через StatProvider
+        if not self.stat_provider.exists(file_path):
             return False
         
-        stat = file_path.stat()
-        current_time = int(datetime.now().timestamp())
+        # Получаем статистику через StatProvider
+        file_stats = self.stat_provider.stat(file_path)
+        current_wall = int(self.time_source.now_wall())
+        metrics = get_metrics()
         
+        # Проверяем, был ли файл в карантине до изменения
+        was_quarantined = entry.is_quarantined(current_wall)
+        old_fail_count = entry.integrity_fail_count
+        
+        # Обновляем статистику файла через новый метод с TimeSource
         changed = entry.update_file_stats(
-            stat.st_size,
-            int(stat.st_mtime),
-            self.config['stable_wait_sec']
+            file_stats.size,
+            file_stats.mtime,
+            self.config['stable_wait_sec'],
+            self.time_source
         )
         
-        if changed or entry.stable_since is not None:
+        # Логируем сброс backoff при изменении размера/времени
+        if changed and old_fail_count > 0:
+            metrics.increment(MetricNames.SIZE_CHANGE_RESET, {
+                'was_quarantined': str(was_quarantined),
+                'old_fail_count': str(old_fail_count)
+            })
+            
+            logger.info(
+                f"Размер/время файла изменился: путь={file_path.name}, "
+                f"сброшен fail_count с {old_fail_count} до 0, "
+                f"был_в_карантине={was_quarantined}"
+            )
+        
+        # Проверяем возможность активации стабильности
+        stability_armed = entry.arm_stability(self.time_source)
+        if stability_armed:
+            metrics.increment(MetricNames.STABILITY_ARMED, {'path': file_path.name})
+            logger.debug(f"Активирована стабильность для файла: {file_path.name}")
+        
+        # Проверяем готовность к integrity проверке
+        if entry.stable_since_mono is not None:
+            elapsed_stable = self.time_source.now_mono() - entry.stable_since_mono
+            if elapsed_stable >= self.config['stable_wait_sec']:
+                # Файл готов к integrity проверке
+                entry.next_check_at = current_wall
+                metrics.increment(MetricNames.STABILITY_TRIGGERED, {'path': file_path.name})
+            else:
+                # Откладываем до готовности
+                due_time = entry.get_stability_due_time(self.config['stable_wait_sec'], self.time_source)
+                entry.next_check_at = int(due_time)
+                metrics.increment(MetricNames.STABILITY_DEFERRED, {'path': file_path.name})
+        
+        # Сохраняем изменения если есть
+        if changed or stability_armed:
             self.store.upsert_file(entry)
             
         return True
@@ -310,23 +369,54 @@ class StatePlanner:
         
         return True
 
-    async def apply_backoff(self, entry: FileEntry):
-        """Применение backoff для повторной проверки"""
-        metrics = get_metrics()
-        metrics.increment(MetricNames.BACKOFF_APPLIED)
+    async def apply_backoff(self, entry: FileEntry, reason: str = "integrity_failed"):
+        """
+        Применение backoff для повторной проверки с метриками и логированием
         
-        # Линейный backoff: step, 2*step, 3*step, ..., max
-        backoff_multiplier = min(max(1, entry.integrity_fail_count), 
-                               self.config['backoff_max_sec'] // self.config['backoff_step_sec'])
+        Args:
+            entry: файловая запись
+            reason: причина backoff (для метрик и логирования)
+        """
+        metrics = get_metrics()
+        current_time = int(self.time_source.now_wall())
+        
+        # Определяем, первый ли это backoff для этого файла
+        is_first_backoff = entry.integrity_fail_count <= 1
+        
+        if is_first_backoff:
+            metrics.increment(MetricNames.BACKOFF_STARTED, {'reason': reason})
+            metrics.increment(MetricNames.INTEGRITY_BACKOFF_STARTED, {'reason': reason})
+        else:
+            metrics.increment(MetricNames.BACKOFF_RESUMED, {'reason': reason})
+            metrics.increment(MetricNames.INTEGRITY_BACKOFF_RESUMED, {'reason': reason})
+        
+        # Линейный backoff с ограничением: step, 2*step, 3*step, ..., max
+        backoff_multiplier = min(
+            max(1, entry.integrity_fail_count), 
+            self.config['backoff_max_sec'] // self.config['backoff_step_sec']
+        )
         delay = min(
             self.config['backoff_step_sec'] * backoff_multiplier,
             self.config['backoff_max_sec']
         )
         
+        # Используем монотонное время для планирования
         entry.schedule_next_check(delay)
         self.store.upsert_file(entry)
         
-        logger.debug(f"Backoff {delay}s для {entry.path} (попытка #{entry.integrity_fail_count})")
+        # Метрики
+        metrics.increment(MetricNames.BACKOFF_APPLIED, {'reason': reason})
+        metrics.record("backoff_delay_sec", delay, {'reason': reason, 'fail_count': str(entry.integrity_fail_count)})
+        
+        # Отслеживаем максимальное количество неудач
+        metrics.record(MetricNames.INTEGRITY_FAIL_COUNT_MAX, entry.integrity_fail_count, {'path': Path(entry.path).name})
+        
+        # Структурированное логирование
+        logger.info(
+            f"Backoff применен: путь={Path(entry.path).name}, "
+            f"задержка={delay}s, попытка=#{entry.integrity_fail_count}, "
+            f"причина={reason}, next_check_at={entry.next_check_at}"
+        )
 
     async def scan_directory(self, directory: Path, delete_original: bool = False, 
                            max_depth: Optional[int] = None) -> int:
@@ -339,14 +429,14 @@ class StatePlanner:
             max_depth: максимальная глубина рекурсии
         
         Returns:
-            Количество обнаруженных файлов
+            Количество НОВЫХ обнаруженных файлов
         """
         if max_depth is None:
             max_depth = self.config.get('max_scan_depth', 2)
         
         video_extensions = set(self.config.get('video_extensions', ['.mp4', '.mkv', '.avi', '.mov', '.m4v', '.wmv', '.flv', '.webm']))
-        discovered_count = 0
-        discovered_files = []
+        total_files_found = 0
+        files_to_process = []
         
         def scan_recursive(path: Path, current_depth: int = 0) -> int:
             if current_depth > max_depth:
@@ -357,7 +447,7 @@ class StatePlanner:
                 for item in path.iterdir():
                     if item.is_file() and item.suffix.lower() in video_extensions:
                         # Собираем файлы для пакетной обработки
-                        discovered_files.append(item)
+                        files_to_process.append(item)
                         count += 1
                     elif item.is_dir() and current_depth < max_depth:
                         count += scan_recursive(item, current_depth + 1)
@@ -366,25 +456,34 @@ class StatePlanner:
             
             return count
         
-        discovered_count = scan_recursive(directory)
+        total_files_found = scan_recursive(directory)
         
         # Пакетная обработка файлов с семафором для ограничения конкурентности
-        if discovered_files:
+        new_files_count = 0
+        if files_to_process:
             max_concurrent = self.config.get('max_concurrent_discovery', 10)
             semaphore = asyncio.Semaphore(max_concurrent)
             
-            async def discover_with_semaphore(file_path: Path):
+            async def discover_with_semaphore(file_path: Path) -> bool:
                 async with semaphore:
+                    # Проверяем, новый ли файл
+                    existing = self.store.get_file(file_path)
                     await self.discover_file(file_path, delete_original)
+                    return existing is None  # True если файл новый
             
-            # Обрабатываем файлы пакетами
-            tasks = [discover_with_semaphore(file_path) for file_path in discovered_files]
-            await asyncio.gather(*tasks, return_exceptions=True)
+            # Обрабатываем файлы пакетами и считаем новые
+            tasks = [discover_with_semaphore(file_path) for file_path in files_to_process]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Считаем успешные результаты (новые файлы)
+            new_files_count = sum(1 for result in results if result is True)
         
-        if discovered_count > 0:
-            logger.info(f"Обнаружено и обработано файлов в {directory}: {discovered_count}")
+        if new_files_count > 0:
+            logger.info(f"Обнаружено новых файлов в {directory}: {new_files_count} (всего: {total_files_found})")
+        elif total_files_found > 0:
+            logger.debug(f"Проверено файлов в {directory}: {total_files_found} (новых: 0)")
         
-        return discovered_count
+        return new_files_count
 
     async def run_maintenance(self) -> Dict[str, Any]:
         """Выполнение задач обслуживания"""
@@ -449,9 +548,18 @@ class StatePlanner:
 
     def get_status(self) -> Dict[str, Any]:
         """Получение статуса планировщика"""
+        current_time = int(self.time_source.now_wall())
+        quarantined_count = self.store.get_quarantined_files_count(current_time)
+        
+        # Обновляем метрики карантина
+        metrics = get_metrics()
+        metrics.record(MetricNames.QUARANTINED_FILES, quarantined_count)
+        
         return {
             'running': self._running,
             'config': self.config,
             'registered_handlers': list(self._action_handlers.keys()),
-            'store_stats': self.store.get_stats()
+            'store_stats': self.store.get_stats(),
+            'quarantined_files': quarantined_count,
+            'current_time': current_time
         }

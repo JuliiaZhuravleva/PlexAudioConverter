@@ -65,6 +65,26 @@ stability_threshold = 30.0
 notify_on_complete = true
 # Автоочистка завершенных загрузок (часы)
 cleanup_completed_hours = 24
+
+[StateManagement]
+# Время ожидания стабильности файла перед запуском integrity (секунды)
+stable_wait_sec = 30
+# URL базы данных для состояний (SQLite)
+storage_url = file:state.db
+# Максимальное количество записей в хранилище
+max_state_entries = 5000
+# Размер батча для обработки файлов
+batch_size = 64
+# Интервал основного цикла планировщика (секунды)
+loop_interval_sec = 5
+# Быстрая проверка целостности
+integrity_quick_mode = true
+# Таймаут для проверки целостности (секунды)
+integrity_timeout_sec = 300
+# Шаг увеличения backoff при неудаче проверки целостности (секунды)
+backoff_step_sec = 30
+# Максимальная задержка backoff при неудаче проверки целостности (секунды)
+backoff_max_sec = 600
 """
 
     def __init__(self, config_file: str = 'monitor_config.ini'):
@@ -82,6 +102,7 @@ cleanup_completed_hours = 24
 
         self.config.read(self.config_file, encoding='utf-8')
         logger.info(f"Конфигурация загружена из: {self.config_file}")
+        self._log_state_management_config()
 
     def create_default_config(self):
         """Создание файла конфигурации по умолчанию"""
@@ -230,3 +251,40 @@ cleanup_completed_hours = 24
                 pending_comments = []
         
         return comments
+    
+    def _log_state_management_config(self):
+        """Логирование применённых значений конфигурации StateManagement"""
+        try:
+            stable_wait_sec = self.getint('StateManagement', 'stable_wait_sec', 30)
+            storage_url = self.get('StateManagement', 'storage_url', 'file:state.db')
+            max_state_entries = self.getint('StateManagement', 'max_state_entries', 5000)
+            batch_size = self.getint('StateManagement', 'batch_size', 64)
+            loop_interval_sec = self.getint('StateManagement', 'loop_interval_sec', 5)
+            integrity_quick_mode = self.getboolean('StateManagement', 'integrity_quick_mode', True)
+            integrity_timeout_sec = self.getint('StateManagement', 'integrity_timeout_sec', 300)
+            
+            logger.info("State Management конфигурация:")
+            logger.info(f"  stable_wait_sec: {stable_wait_sec}")
+            logger.info(f"  storage_url: {storage_url}")
+            logger.info(f"  max_state_entries: {max_state_entries}")
+            logger.info(f"  batch_size: {batch_size}")
+            logger.info(f"  loop_interval_sec: {loop_interval_sec}")
+            logger.info(f"  integrity_quick_mode: {integrity_quick_mode}")
+            logger.info(f"  integrity_timeout_sec: {integrity_timeout_sec}")
+        except Exception as e:
+            logger.error(f"Ошибка логирования конфигурации StateManagement: {e}")
+    
+    def get_state_config(self) -> dict:
+        """Получение конфигурации для StateStore и Planner"""
+        return {
+            'stable_wait_sec': self.getint('StateManagement', 'stable_wait_sec', 30),
+            'storage_url': self.get('StateManagement', 'storage_url', 'file:state.db'),
+            'max_state_entries': self.getint('StateManagement', 'max_state_entries', 5000),
+            'batch_size': self.getint('StateManagement', 'batch_size', 64),
+            'loop_interval_sec': self.getint('StateManagement', 'loop_interval_sec', 5),
+            'integrity_quick_mode': self.getboolean('StateManagement', 'integrity_quick_mode', True),
+            'backoff_step_sec': max(5, self.getint('StateManagement', 'backoff_step_sec', 30)),
+            'backoff_max_sec': min(3600, self.getint('StateManagement', 'backoff_max_sec', 600)),
+            'integrity_timeout_sec': self.getint('StateManagement', 'integrity_timeout_sec', 300),
+            'video_extensions': [ext.strip() for ext in self.get('FileTypes', 'extensions', '.mp4,.mkv').split(',')]
+        }

@@ -18,6 +18,7 @@ from state_management.enums import IntegrityStatus, ProcessedStatus
 from state_management.store import StateStore
 from state_management.planner import StatePlanner
 from state_management.config import StateConfig
+from state_management.time_provider import FakeTimeSource, FakeStatProvider, set_time_source, set_stat_provider, reset_to_system
 
 
 class TempFS:
@@ -145,6 +146,15 @@ class FakeClock:
     def set_time(self, timestamp: float):
         """Установить конкретное время"""
         self.current_time = timestamp
+    
+    def get_fake_time_source(self) -> FakeTimeSource:
+        """Получить FakeTimeSource для использования в новом коде"""
+        # Создаем синхронизированный FakeTimeSource
+        fake_source = FakeTimeSource(
+            initial_wall=self.current_time,
+            initial_mono=self.current_time + self.monotonic_offset
+        )
+        return fake_source
 
 
 @dataclass
@@ -273,6 +283,10 @@ class StateStoreFixture:
         )
         # StateStore автоматически инициализируется в конструкторе
         self.store = StateStore(db_path)
+        
+        # Создаем StatePlanner для этого store с поддержкой TimeSource
+        # Используем текущий глобальный TimeSource (может быть подменен в тестах)
+        self.planner = StatePlanner(self.store, self.config.__dict__)
     
     def __enter__(self):
         return self
@@ -345,6 +359,24 @@ class StateStoreFixture:
         """Проверить отсутствие due файлов"""
         due_files = self.store.get_due_files(limit=100)
         assert len(due_files) == 0, f"Expected no due files, got {len(due_files)}"
+    
+    def _process_due_files_sync(self, limit: int = None) -> int:
+        """Синхронная обертка для process_due_files для тестов"""
+        import asyncio
+        
+        # Сохраняем оригинальный метод
+        original_method = self.planner.process_due_files
+        
+        try:
+            return asyncio.run(original_method(limit))
+        except RuntimeError:
+            # Если asyncio.run не работает, пытаемся через get_event_loop
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                return loop.run_until_complete(original_method(limit))
+            finally:
+                loop.close()
 
 
 class StatePlannerFixture:

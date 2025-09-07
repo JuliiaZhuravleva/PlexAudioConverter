@@ -48,7 +48,9 @@ class StateStore:
             has_en2 INTEGER,
             last_error TEXT,
             extra TEXT,
-            updated_at INTEGER NOT NULL
+            updated_at INTEGER NOT NULL,
+            last_change_at REAL,
+            stable_since_mono REAL
         )
     """
     
@@ -93,6 +95,9 @@ class StateStore:
         # Инициализируем БД
         self._init_database()
         
+        # Выполняем миграцию для новых полей monotonic time
+        self._migrate_monotonic_fields()
+        
         logger.info(f"StateStore инициализирован: {self.db_path_str}")
 
     def _init_database(self):
@@ -105,6 +110,24 @@ class StateStore:
             # Создаем индексы
             for index_sql in self.INDEXES:
                 conn.execute(index_sql)
+            
+            conn.commit()
+
+    def _migrate_monotonic_fields(self):
+        """Миграция для добавления полей monotonic time"""
+        with self._get_connection() as conn:
+            # Проверяем, существуют ли новые поля
+            cursor = conn.execute("PRAGMA table_info(files)")
+            columns = {row[1] for row in cursor.fetchall()}
+            
+            # Добавляем новые поля если их нет
+            if 'last_change_at' not in columns:
+                conn.execute("ALTER TABLE files ADD COLUMN last_change_at REAL")
+                logger.info("Добавлено поле last_change_at в таблицу files")
+            
+            if 'stable_since_mono' not in columns:
+                conn.execute("ALTER TABLE files ADD COLUMN stable_since_mono REAL")
+                logger.info("Добавлено поле stable_since_mono в таблицу files")
             
             conn.commit()
 
@@ -195,7 +218,9 @@ class StateStore:
             int(entry.has_en2) if entry.has_en2 is not None else None,
             entry.last_error,
             extra_json,
-            entry.updated_at
+            entry.updated_at,
+            entry.last_change_at,
+            entry.stable_since_mono
         )
 
     def _group_entry_to_values(self, entry: GroupEntry) -> Tuple:
@@ -256,8 +281,8 @@ class StateStore:
                             first_seen_at, stable_since, next_check_at,
                             integrity_status, integrity_score, integrity_mode_used,
                             integrity_fail_count, processed_status, has_en2,
-                            last_error, extra, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            last_error, extra, updated_at, last_change_at, stable_since_mono
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, self._file_entry_to_values(entry))
                     
                     entry.id = cursor.lastrowid
@@ -269,7 +294,7 @@ class StateStore:
                             first_seen_at = ?, stable_since = ?, next_check_at = ?,
                             integrity_status = ?, integrity_score = ?, integrity_mode_used = ?,
                             integrity_fail_count = ?, processed_status = ?, has_en2 = ?,
-                            last_error = ?, extra = ?, updated_at = ?
+                            last_error = ?, extra = ?, updated_at = ?, last_change_at = ?, stable_since_mono = ?
                         WHERE id = ?
                     """, self._file_entry_to_values(entry) + (entry.id,))
                 
@@ -309,6 +334,24 @@ class StateStore:
                 files.append(self._row_to_file_entry(row))
             
             return files
+    
+    def get_quarantined_files_count(self, current_time: Optional[int] = None) -> int:
+        """
+        Получение количества файлов в карантине
+        
+        Карантин = файлы с неудачной проверкой целостности и будущим next_check_at
+        """
+        if current_time is None:
+            current_time = int(datetime.now().timestamp())
+        
+        with self._get_connection() as conn:
+            cursor = conn.execute("""
+                SELECT COUNT(*) FROM files 
+                WHERE integrity_status IN ('INCOMPLETE', 'ERROR') 
+                AND next_check_at > ?
+            """, (current_time,))
+            
+            return cursor.fetchone()[0]
 
     def get_files_by_group(self, group_id: str) -> List[FileEntry]:
         """Получение всех файлов группы"""

@@ -379,7 +379,21 @@ class MetricNames:
     PLANNER_LOOP_DURATION_MS = "planner_loop_duration_ms"
     DUE_FILES_PROCESSED = "due_files_processed"
     STATE_ENTRIES_PRUNED = "state_entries_pruned"  # GC
+    
+    # Backoff и quarantine
     BACKOFF_APPLIED = "backoff_applied"
+    BACKOFF_STARTED = "backoff_started"
+    BACKOFF_RESUMED = "backoff_resumed"
+    INTEGRITY_BACKOFF_STARTED = "integrity_backoff_started"
+    INTEGRITY_BACKOFF_RESUMED = "integrity_backoff_resumed"
+    INTEGRITY_FAIL_COUNT_MAX = "integrity_fail_count_max"
+    QUARANTINED_FILES = "quarantined_files"
+    SIZE_CHANGE_RESET = "size_change_reset"
+    
+    # Stability tracking (monotonic time based)
+    STABILITY_ARMED = "stability_armed"
+    STABILITY_DEFERRED = "stability_deferred" 
+    STABILITY_TRIGGERED = "stability_triggered"
     
     # Ошибки
     STATE_STORE_ERRORS = "state_store_errors"

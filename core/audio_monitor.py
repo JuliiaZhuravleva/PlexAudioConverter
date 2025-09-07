@@ -4,7 +4,7 @@ import json
 import asyncio
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Dict, List
+from typing import Dict, List, Optional, Any
 from .logger import logger
 from .telegram_notifier import TelegramNotifier
 from .config_manager import ConfigManager
@@ -14,10 +14,23 @@ from .video_integrity_checker import VideoIntegrityChecker, VideoIntegrityStatus
 class AudioMonitor:
     """Основной класс мониторинга"""
 
-    def __init__(self, config: ConfigManager):
+    def __init__(self, config: ConfigManager, state_store=None, state_planner=None):
         self.config = config
         self.running = False
         self.notifier = None
+        
+        # State management components (dependency injection)
+        self.state_store = state_store
+        self.state_planner = state_planner
+        
+        # Discovery adapter for platform edge tests compatibility
+        if state_store and state_planner:
+            from state_management.discovery_adapter import DiscoveryAdapter
+            self._discovery_adapter = DiscoveryAdapter(state_store, state_planner)
+        else:
+            self._discovery_adapter = None
+        
+        # Legacy processed files (for migration and compatibility)
         self.processed_files = set()
         self.stats = {
             'total_processed': 0,
@@ -47,6 +60,10 @@ class AudioMonitor:
 
         # Загрузка истории обработанных файлов
         self.load_processed_files()
+        
+        # Миграция данных в StateStore если требуется
+        if self.state_store is not None:
+            self.migrate_legacy_data()
         
         # Запуск мониторинга загрузок
         if config.getboolean('Download', 'enabled', True):
@@ -95,9 +112,9 @@ class AudioMonitor:
                             logger.debug(f"Пропускаем файл (неподходящее расширение): {item.name}")
                             continue
 
-                        # Пропускаем уже конвертированные файлы (.stereo, .converted)
+                        # Пропускаем уже конвертированные файлы (.stereo, .converted) - они не должны попадать в StateStore
                         if any(item.stem.endswith(suffix) for suffix in ['.stereo', '.converted']):
-                            logger.debug(f"Пропускаем конвертированный файл: {item.name}")
+                            logger.debug(f"Пропускаем конвертированный файл (не должен обрабатываться): {item.name}")
                             continue
 
                         # Проверяем размер
@@ -160,6 +177,66 @@ class AudioMonitor:
                 logger.info(f"Загружена история: {len(self.processed_files)} файлов")
             except Exception as e:
                 logger.error(f"Ошибка загрузки истории: {e}")
+
+    def migrate_legacy_data(self):
+        """Миграция данных из legacy processed_files в StateStore"""
+        if not self.processed_files or self.state_store is None:
+            return
+        
+        try:
+            from state_management.models import create_file_entry_from_path
+            from state_management.enums import ProcessedStatus
+            from datetime import datetime
+            
+            migrated_count = 0
+            for file_path_str in self.processed_files:
+                try:
+                    file_path = Path(file_path_str)
+                    if not file_path.exists():
+                        logger.debug(f"Пропускаем миграцию отсутствующего файла: {file_path_str}")
+                        continue
+                    
+                    # Проверяем, есть ли уже запись в StateStore
+                    existing = self.state_store.get_file(file_path)
+                    if existing is not None:
+                        logger.debug(f"Файл уже в StateStore: {file_path.name}")
+                        continue
+                    
+                    # Создаем запись для обработанного файла
+                    entry = create_file_entry_from_path(file_path, delete_original=False)
+                    entry.processed_status = ProcessedStatus.CONVERTED  # предполагаем что все legacy файлы были успешно конвертированы
+                    entry.next_check_at = int(datetime.now().timestamp()) + 365 * 24 * 3600  # +1 год (не проверять)
+                    
+                    # Заполняем приблизительные временные метки
+                    if file_path.exists():
+                        stat = file_path.stat()
+                        entry.first_seen_at = int(stat.st_mtime)
+                        entry.updated_at = int(stat.st_mtime)
+                    
+                    self.state_store.upsert_file(entry)
+                    
+                    # Обновляем группу
+                    if self.state_planner:
+                        import asyncio
+                        try:
+                            loop = asyncio.get_running_loop()
+                            loop.create_task(self.state_planner.update_group_presence(entry.group_id, delete_original=False))
+                        except RuntimeError:
+                            # Нет активного event loop - пропускаем обновление группы
+                            pass
+                    
+                    migrated_count += 1
+                    
+                except Exception as e:
+                    logger.error(f"Ошибка миграции файла {file_path_str}: {e}")
+            
+            if migrated_count > 0:
+                logger.info(f"Мигрировано файлов в StateStore: {migrated_count}")
+                # После миграции очищаем legacy список (больше не источник истины)
+                logger.info("Legacy processed_files больше не используется как источник истины")
+                
+        except Exception as e:
+            logger.error(f"Ошибка миграции legacy данных: {e}")
 
     def save_processed_files(self):
         """Сохранение списка обработанных файлов"""
@@ -262,10 +339,29 @@ class AudioMonitor:
             self.stats['errors'] += 1
             logger.error(f"Ошибка обработки {file_path}: {e}")
 
-        # Добавляем в обработанные
-        self.processed_files.add(str(file_path))
+        # Обновляем StateStore если доступен, иначе используем legacy структуру
+        if self.state_store is not None:
+            # Обновляем запись в StateStore
+            try:
+                existing_entry = self.state_store.get_file(file_path)
+                if existing_entry:
+                    from state_management.enums import ProcessedStatus
+                    if result['status'] == 'success':
+                        existing_entry.processed_status = ProcessedStatus.CONVERTED
+                    else:
+                        existing_entry.processed_status = ProcessedStatus.CONVERT_FAILED
+                        existing_entry.last_error = result.get('error', 'Unknown error')
+                    
+                    existing_entry.updated_at = int(datetime.now().timestamp())
+                    self.state_store.upsert_file(existing_entry)
+            except Exception as e:
+                logger.error(f"Ошибка обновления StateStore: {e}")
+        else:
+            # Legacy mode - добавляем в обработанные
+            self.processed_files.add(str(file_path))
+            self.save_processed_files()
+        
         self.stats['total_processed'] += 1
-        self.save_processed_files()
 
         # Удаляем файл из мониторинга загрузок после обработки
         self.download_monitor.remove_file(file_path)
@@ -624,3 +720,255 @@ class AudioMonitor:
                     
         except Exception as e:
             logger.error(f"Ошибка обработки отложенных уведомлений: {e}")
+
+    async def monitor_loop_with_planner(self):
+        """Основной цикл мониторинга с использованием StatePlanner"""
+        if self.state_store is None or self.state_planner is None:
+            logger.error("StateStore или StatePlanner не инициализированы - fallback на legacy monitor_loop")
+            return await self.monitor_loop()
+        
+        watch_dir_str = self.config.get('General', 'watch_directory')
+        watch_dir_abs = os.path.abspath(watch_dir_str)
+        check_interval = self.config.getint('General', 'check_interval', 300)
+        due_limit = self.config.getint('StateManagement', 'batch_size', 64)
+
+        # Проверяем существование директории
+        if not os.path.exists(watch_dir_abs):
+            logger.error(f"Директория не существует: {watch_dir_abs}")
+            logger.info(f"Попытка создать директорию: {watch_dir_abs}")
+            try:
+                os.makedirs(watch_dir_abs, exist_ok=True)
+                logger.info(f"Директория создана: {watch_dir_abs}")
+            except Exception as e:
+                logger.error(f"Не удалось создать директорию {watch_dir_abs}: {e}")
+                logger.error("Мониторинг остановлен")
+                return
+
+        if not os.path.isdir(watch_dir_abs):
+            logger.error(f"Путь не является директорией: {watch_dir_abs}")
+            return
+
+        watch_dir = Path(watch_dir_abs)
+        logger.info(f"Начинаем мониторинг с StatePlanner: {watch_dir}")
+        logger.info(f"Интервал сканирования: {check_interval} секунд")
+        logger.info(f"Размер батча: {due_limit}")
+
+        # Регистрируем обработчики действий планировщика
+        await self.register_planner_handlers()
+
+        # Отправляем визуальное уведомление о запуске
+        if self.notifier and self.config.getboolean('Telegram', 'notify_on_start'):
+            await self.send_startup_notification(watch_dir, check_interval)
+
+        self.running = True
+        last_summary_time = datetime.now()
+        last_scan_time = datetime.now() - timedelta(seconds=check_interval)  # Принудительное сканирование при запуске
+        delete_original = self.config.getboolean('General', 'delete_original', False)
+
+        while self.running:
+            try:
+                current_time = datetime.now()
+                
+                # Отправляем отложенные уведомления о завершении загрузок
+                await self._send_pending_download_notifications()
+                
+                # Периодическое сканирование директории (Discovery)
+                if (current_time - last_scan_time).total_seconds() >= check_interval:
+                    logger.info("Выполняем сканирование директории...")
+                    discovered_count = await self.state_planner.scan_directory(
+                        watch_dir, 
+                        delete_original=delete_original,
+                        max_depth=self.config.getint('General', 'max_depth', 2)
+                    )
+                    if discovered_count > 0:
+                        logger.info(f"Обнаружено новых файлов: {discovered_count}")
+                    
+                    last_scan_time = current_time
+
+                # Обработка due-файлов (основная работа планировщика)
+                processed_count = await self.state_planner.process_due_files(limit=due_limit)
+                if processed_count > 0:
+                    logger.info(f"Обработано due-файлов: {processed_count}")
+
+                # Отправляем сводку раз в час
+                if self.notifier and self.config.getboolean('Telegram', 'notify_summary'):
+                    if (current_time - last_summary_time).total_seconds() >= 3600:
+                        await self.send_summary()
+                        last_summary_time = current_time
+
+                # Sleep стратегия: спим до следующего due или idle_cap
+                current_timestamp = int(current_time.timestamp())
+                due_files = self.state_store.get_due_files(current_timestamp, 1)  # получаем следующий due файл
+                
+                if due_files:
+                    # Есть due файлы - спим минимально
+                    sleep_time = max(0, min(due_files[0].next_check_at - current_timestamp, 1))
+                else:
+                    # Нет due файлов - спим до следующего сканирования
+                    next_scan_in = check_interval - (current_time - last_scan_time).total_seconds()
+                    sleep_time = max(1, min(next_scan_in, 5))  # максимум 5 секунд idle
+                
+                await asyncio.sleep(sleep_time)
+
+            except Exception as e:
+                logger.error(f"Ошибка в цикле мониторинга с планировщиком: {e}")
+                # Короткая пауза при ошибке
+                await asyncio.sleep(5)
+
+        logger.info("Цикл мониторинга с планировщиком завершен")
+
+    async def register_planner_handlers(self):
+        """Регистрация обработчиков действий для планировщика"""
+        from state_management.planner import PlannerAction
+        
+        # Регистрируем обработчик проверки целостности
+        self.state_planner.register_handler(
+            PlannerAction.CHECK_INTEGRITY,
+            self.handle_integrity_check
+        )
+        
+        # Регистрируем обработчик анализа аудио
+        self.state_planner.register_handler(
+            PlannerAction.PROCESS_AUDIO,
+            self.handle_audio_analysis
+        )
+        
+        logger.info("Обработчики планировщика зарегистрированы")
+
+    async def handle_integrity_check(self, task) -> bool:
+        """Обработчик проверки целостности видео"""
+        try:
+            from state_management.enums import IntegrityStatus
+            from datetime import datetime
+            
+            file_entry = task.file_entry
+            file_path = Path(file_entry.path)
+            
+            if not file_path.exists():
+                logger.warning(f"Файл не существует для проверки целостности: {file_path}")
+                return False
+            
+            # Отмечаем как PENDING и защищаемся от повторного выполнения
+            file_entry.integrity_status = IntegrityStatus.PENDING
+            file_entry.next_check_at = int(datetime.now().timestamp()) + self.config.getint('StateManagement', 'integrity_timeout_sec', 300)
+            file_entry.updated_at = int(datetime.now().timestamp())
+            self.state_store.upsert_file(file_entry)
+            
+            logger.info(f"Запуск проверки целостности: {file_path.name}")
+            
+            # Выполняем проверку целостности через существующий checker
+            integrity_info = self.integrity_checker.check_video_integrity(file_path)
+            integrity_status = integrity_info.status
+            
+            # Обновляем результат в StateStore
+            if integrity_status == VideoIntegrityStatus.COMPLETE:
+                file_entry.integrity_status = IntegrityStatus.COMPLETE
+                file_entry.integrity_score = 1.0
+                file_entry.next_check_at = int(datetime.now().timestamp())  # готов к следующему этапу
+                logger.info(f"Проверка целостности успешна: {file_path.name} ({integrity_info.detection_method})")
+            elif integrity_status == VideoIntegrityStatus.INCOMPLETE:
+                file_entry.integrity_status = IntegrityStatus.INCOMPLETE
+                file_entry.integrity_score = 0.5
+                file_entry.integrity_fail_count += 1
+                file_entry.last_error = f"incomplete: {integrity_info.error_message}"
+                # Планируем повторную проверку через backoff
+                await self.state_planner.apply_backoff(file_entry)
+                logger.warning(f"Файл неполный, backoff применен: {file_path.name} - {integrity_info.error_message}")
+            else:
+                file_entry.integrity_status = IntegrityStatus.ERROR
+                file_entry.integrity_score = 0.0
+                file_entry.integrity_fail_count += 1
+                file_entry.last_error = f"integrity_check_error: {integrity_status.value} - {integrity_info.error_message}"
+                await self.state_planner.apply_backoff(file_entry)
+                logger.error(f"Ошибка проверки целостности: {file_path.name} - {integrity_status.value} - {integrity_info.error_message}")
+            
+            file_entry.updated_at = int(datetime.now().timestamp())
+            self.state_store.upsert_file(file_entry)
+            return True
+            
+        except Exception as e:
+            logger.error(f"Ошибка обработчика проверки целостности: {e}")
+            # Обновляем статус ошибки
+            if hasattr(task, 'file_entry') and task.file_entry:
+                task.file_entry.integrity_status = IntegrityStatus.ERROR
+                task.file_entry.last_error = f"integrity_handler_error: {str(e)}"
+                self.state_store.upsert_file(task.file_entry)
+            return False
+
+    async def handle_audio_analysis(self, task) -> bool:
+        """Обработчик анализа аудио дорожек"""
+        try:
+            from state_management.enums import ProcessedStatus
+            from datetime import datetime
+            
+            file_entry = task.file_entry
+            file_path = Path(file_entry.path)
+            
+            if not file_path.exists():
+                logger.warning(f"Файл не существует для анализа аудио: {file_path}")
+                return False
+            
+            logger.info(f"Анализ аудио дорожек: {file_path.name}")
+            
+            # Анализируем аудио дорожки (используем существующую логику)
+            file_info = await self.analyze_file_info(file_path)
+            
+            # Проверяем наличие английской 2.0 дорожки
+            has_english_stereo = False
+            for track in file_info.get('audio_tracks', []):
+                if (track.get('channels', 0) == 2 and 
+                    track.get('language', '').lower() in ['eng', 'english', 'unknown']):
+                    has_english_stereo = True
+                    break
+            
+            # Обновляем запись
+            file_entry.has_en2 = has_english_stereo
+            
+            if has_english_stereo:
+                file_entry.processed_status = ProcessedStatus.SKIPPED_HAS_EN2
+                logger.info(f"Файл уже имеет EN2 дорожку, пропускаем: {file_path.name}")
+            else:
+                # Передаем в конвертацию через существующую логику
+                file_entry.processed_status = ProcessedStatus.NEW
+                logger.info(f"Файл готов к конвертации: {file_path.name}")
+                
+                # Запускаем конвертацию
+                conversion_result = await self.process_file(file_path)
+                if conversion_result['status'] == 'success':
+                    file_entry.processed_status = ProcessedStatus.CONVERTED
+                else:
+                    file_entry.processed_status = ProcessedStatus.CONVERT_FAILED
+                    file_entry.last_error = conversion_result.get('error', 'Unknown conversion error')
+            
+            file_entry.next_check_at = int(datetime.now().timestamp())  # готов к обновлению группы
+            file_entry.updated_at = int(datetime.now().timestamp())
+            self.state_store.upsert_file(file_entry)
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Ошибка обработчика анализа аудио: {e}")
+            if hasattr(task, 'file_entry') and task.file_entry:
+                task.file_entry.processed_status = ProcessedStatus.CONVERT_FAILED
+                task.file_entry.last_error = f"audio_analysis_error: {str(e)}"
+                self.state_store.upsert_file(task.file_entry)
+            return False
+    
+    def scan_directory(self, directory: str, delete_original: bool = False) -> Dict[str, Any]:
+        """
+        Compatibility method for platform edge tests (T-501 to T-504)
+        
+        Delegates to DiscoveryAdapter for state-based file discovery
+        
+        Args:
+            directory: directory path to scan
+            delete_original: original deletion mode
+        
+        Returns:
+            Discovery result dictionary
+        """
+        if not self._discovery_adapter:
+            logger.error("scan_directory вызван без state management компонентов")
+            raise RuntimeError("AudioMonitor не инициализирован с state_store и state_planner")
+        
+        return self._discovery_adapter.discover_directory(directory, delete_original)
