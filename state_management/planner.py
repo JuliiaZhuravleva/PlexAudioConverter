@@ -124,7 +124,7 @@ class StatePlanner:
                 entry = create_file_entry_from_path(file_path, delete_original)
                 # Инициализируем monotonic time для нового файла
                 entry.last_change_at = self.time_source.now_mono()
-                entry.next_check_at = int(self.time_source.now_wall()) + 2  # проверить через 2 секунды
+                entry.next_check_at = int(self.time_source.now_wall())  # проверить сразу
                 entry = self.store.upsert_file(entry)
                 
                 logger.info(f"Обнаружен новый файл: {file_path.name} (ID: {entry.id})")
@@ -201,6 +201,19 @@ class StatePlanner:
             logger.info(f"Обработано файлов: {processed_count}/{len(due_files)}")
         
         return processed_count
+
+    def get_due_files(self, limit: int = None) -> List[FileEntry]:
+        """
+        Получить файлы, готовые к обработке (делегирование к store)
+        
+        Args:
+            limit: максимальное количество файлов
+        
+        Returns:
+            Список файлов, готовых к обработке
+        """
+        current_time = int(self.time_source.now_wall())
+        return self.store.get_due_files(current_time, limit)
 
     async def _determine_next_action(self, entry: FileEntry) -> Optional[PlannerAction]:
         """Определение следующего действия для файла"""

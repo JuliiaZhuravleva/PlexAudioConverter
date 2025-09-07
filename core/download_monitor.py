@@ -305,8 +305,8 @@ class DownloadMonitor:
             file_path = file_info.file_path
             
             # Check 1: File size reasonableness (should be > 10MB for video files)
-            if file_info.current_size < 10 * 1024 * 1024:  # 10MB
-                logger.debug(f"File size too small: {file_info.current_size} bytes")
+            if file_info.size < 10 * 1024 * 1024:  # 10MB
+                logger.debug(f"File size too small: {file_info.size} bytes")
                 return DownloadStatus.DOWNLOADING
                 
             # Check 2: Recent modification time (modified within last 2 minutes = likely downloading)

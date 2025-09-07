@@ -20,6 +20,10 @@ from core.config_manager import ConfigManager
 from core.audio_monitor import AudioMonitor
 from core.logger import logger
 
+# State management imports
+from state_management.store import StateStore
+from state_management.planner import StatePlanner
+
 # Для Windows службы
 try:
     import win32serviceutil
@@ -40,8 +44,18 @@ async def main():
     if config.get('General', 'watch_directory') == 'C:\\Download':
         logger.warning("Используется директория по умолчанию. Отредактируйте monitor_config.ini!")
 
-    # Создаем мониторинг
-    monitor = AudioMonitor(config)
+    # Инициализация StateStore и Planner
+    state_config = config.get_state_config()
+    storage_path = state_config['storage_url'].replace('file:', '') if state_config['storage_url'].startswith('file:') else state_config['storage_url']
+    
+    state_store = StateStore(storage_path)
+    state_planner = StatePlanner(state_store, state_config)
+    
+    logger.info(f"StateStore инициализирован: {storage_path}")
+    logger.info(f"StatePlanner инициализирован с batch_size: {state_config['batch_size']}")
+
+    # Создаем мониторинг с внедрением зависимостей
+    monitor = AudioMonitor(config, state_store, state_planner)
 
     # Обработка сигналов для корректной остановки
     def signal_handler(sig, frame):
@@ -53,7 +67,7 @@ async def main():
 
     # Запускаем мониторинг
     try:
-        await monitor.monitor_loop()
+        await monitor.monitor_loop_with_planner()
     except KeyboardInterrupt:
         logger.info("Остановлено пользователем (Ctrl+C)")
     except Exception as e:
@@ -61,6 +75,11 @@ async def main():
     finally:
         logger.info("Завершение работы мониторинга...")
         monitor.stop()
+        
+        # Остановка планировщика и закрытие хранилища
+        state_planner.stop()
+        state_store.close()
+        logger.info("StateStore и StatePlanner завершены")
         
         # Отправляем уведомление о завершении
         if monitor.notifier and monitor.config.getboolean('Telegram', 'notify_on_start'):

@@ -266,15 +266,64 @@ class StateStore:
                 return self._row_to_file_entry(row)
             return None
 
-    def upsert_file(self, entry: FileEntry) -> FileEntry:
+    def upsert_file(self, entry=None, **kwargs) -> FileEntry:
         """
         Обновление или создание файла
-        Возвращает обновленный FileEntry с заполненным ID
+        
+        Args:
+            entry: FileEntry object (new API)
+            **kwargs: path, size_bytes, mtime, etc. (legacy API for tests)
+            
+        Returns:
+            Обновленный FileEntry с заполненным ID
         """
+        from .models import FileEntry
+        from .enums import IntegrityStatus, ProcessedStatus
+        import time
+        
+        # Backward compatibility: if called with kwargs instead of FileEntry
+        if entry is None and kwargs:
+            from .models import normalize_group_id
+            
+            # Auto-generate group_id if not provided
+            file_path = kwargs.get('path')
+            if file_path and 'group_id' not in kwargs:
+                group_id, is_stereo_detected = normalize_group_id(file_path)
+                kwargs['group_id'] = group_id
+                # Use detected is_stereo if not explicitly provided
+                if 'is_stereo' not in kwargs:
+                    kwargs['is_stereo'] = is_stereo_detected
+                    
+            # Create FileEntry from kwargs
+            entry = FileEntry(
+                path=kwargs.get('path'),
+                size_bytes=kwargs.get('size_bytes', 0),
+                mtime=int(kwargs.get('mtime', time.time())),
+                integrity_status=kwargs.get('integrity_status', IntegrityStatus.UNKNOWN),
+                processed_status=kwargs.get('processed_status', ProcessedStatus.NEW),
+                first_seen_at=int(kwargs.get('first_seen_at', time.time())),
+                next_check_at=int(kwargs.get('next_check_at', time.time())),
+                is_stereo=kwargs.get('is_stereo', False),
+                group_id=kwargs.get('group_id'),
+                integrity_score=kwargs.get('integrity_score'),
+                integrity_mode_used=kwargs.get('integrity_mode_used'),
+                integrity_fail_count=kwargs.get('integrity_fail_count', 0),
+                has_en2=kwargs.get('has_en2'),
+                last_error=kwargs.get('last_error'),
+                extra=kwargs.get('extra', {}),
+                updated_at=int(kwargs.get('updated_at', time.time())),
+                last_change_at=int(kwargs.get('last_change_at', time.time())),
+                stable_since=kwargs.get('stable_since'),
+                stable_since_mono=kwargs.get('stable_since_mono')
+            )
+        elif entry is None:
+            raise ValueError("Either 'entry' parameter or keyword arguments must be provided")
+            
+        # Now proceed with the original logic
         with self._get_connection() as conn:
             try:
                 if entry.id is None:
-                    # Создание нового файла
+                    # Upsert - создание или обновление на основе пути
                     cursor = conn.execute("""
                         INSERT INTO files (
                             path, group_id, is_stereo, size_bytes, mtime,
@@ -283,11 +332,32 @@ class StateStore:
                             integrity_fail_count, processed_status, has_en2,
                             last_error, extra, updated_at, last_change_at, stable_since_mono
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(path) DO UPDATE SET
+                            group_id = excluded.group_id,
+                            is_stereo = excluded.is_stereo,
+                            size_bytes = excluded.size_bytes,
+                            mtime = excluded.mtime,
+                            stable_since = excluded.stable_since,
+                            next_check_at = excluded.next_check_at,
+                            integrity_status = excluded.integrity_status,
+                            integrity_score = excluded.integrity_score,
+                            integrity_mode_used = excluded.integrity_mode_used,
+                            integrity_fail_count = excluded.integrity_fail_count,
+                            processed_status = excluded.processed_status,
+                            has_en2 = excluded.has_en2,
+                            last_error = excluded.last_error,
+                            extra = excluded.extra,
+                            updated_at = excluded.updated_at,
+                            last_change_at = excluded.last_change_at,
+                            stable_since_mono = excluded.stable_since_mono
                     """, self._file_entry_to_values(entry))
                     
-                    entry.id = cursor.lastrowid
+                    # Получаем ID записи (или новой, или обновленной)
+                    entry.id = cursor.lastrowid or conn.execute(
+                        "SELECT id FROM files WHERE path = ?", (entry.path,)
+                    ).fetchone()[0]
                 else:
-                    # Обновление существующего файла
+                    # Обновление существующего файла по ID
                     conn.execute("""
                         UPDATE files SET
                             path = ?, group_id = ?, is_stereo = ?, size_bytes = ?, mtime = ?,
@@ -305,6 +375,143 @@ class StateStore:
             except sqlite3.IntegrityError as e:
                 conn.rollback()
                 raise StateStoreError(f"Ошибка сохранения файла {entry.path}: {e}")
+
+    def update_file_size(self, file_path: str, new_size: int, new_mtime: float) -> bool:
+        """
+        Backward compatibility method: Update only file size and modification time
+        
+        Args:
+            file_path: путь к файлу
+            new_size: новый размер файла
+            new_mtime: новое время модификации
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        import time
+        try:
+            with self._get_connection() as conn:
+                # Update только size и mtime, сбросить stable_since если размер изменился
+                cursor = conn.execute("""
+                    UPDATE files 
+                    SET size_bytes = ?, 
+                        mtime = ?, 
+                        stable_since = CASE 
+                            WHEN size_bytes != ? THEN NULL 
+                            ELSE stable_since 
+                        END,
+                        updated_at = ?,
+                        last_change_at = CASE
+                            WHEN size_bytes != ? THEN ?
+                            ELSE last_change_at
+                        END
+                    WHERE path = ?
+                """, (new_size, int(new_mtime), new_size, int(time.time()), new_size, int(time.time()), file_path))
+                
+                conn.commit()
+                rows_affected = cursor.rowcount
+                
+                if rows_affected > 0:
+                    logger.debug(f"Обновлен размер файла: {file_path} -> {new_size} bytes")
+                    return True
+                else:
+                    logger.warning(f"Файл не найден для обновления размера: {file_path}")
+                    return False
+                    
+        except Exception as e:
+            logger.error(f"Ошибка обновления размера файла {file_path}: {e}")
+            return False
+
+    def check_stability_and_schedule(self, file_path: str) -> bool:
+        """
+        Backward compatibility method: Check file stability and schedule for processing if stable
+        
+        Args:
+            file_path: путь к файлу
+            
+        Returns:
+            True if file became stable, False otherwise
+        """
+        import time
+        try:
+            with self._get_connection() as conn:
+                # Get current file info
+                cursor = conn.execute("""
+                    SELECT id, size_bytes, last_change_at, stable_since, next_check_at
+                    FROM files WHERE path = ?
+                """, (file_path,))
+                
+                row = cursor.fetchone()
+                if not row:
+                    logger.warning(f"Файл не найден для проверки стабильности: {file_path}")
+                    return False
+                
+                file_id, size_bytes, last_change_at, stable_since, next_check_at = row
+                current_time = int(time.time())
+                
+                # If already stable, nothing to do
+                if stable_since is not None:
+                    return True
+                
+                # Check if enough time has passed since last change
+                # Default to 30 seconds if last_change_at is None
+                stable_wait_sec = 30  # This should come from config but use default for compatibility
+                time_since_change = current_time - (last_change_at or current_time)
+                
+                if time_since_change >= stable_wait_sec:
+                    # Mark as stable and schedule for immediate processing
+                    conn.execute("""
+                        UPDATE files 
+                        SET stable_since = ?,
+                            next_check_at = ?,
+                            updated_at = ?
+                        WHERE id = ?
+                    """, (current_time, current_time, current_time, file_id))
+                    
+                    conn.commit()
+                    logger.debug(f"Файл стабилизировался и запланирован: {file_path}")
+                    return True
+                else:
+                    logger.debug(f"Файл еще не стабилен: {file_path} (осталось {stable_wait_sec - time_since_change}s)")
+                    return False
+                    
+        except Exception as e:
+            logger.error(f"Ошибка проверки стабильности файла {file_path}: {e}")
+            return False
+
+    def set_integrity_status(self, file_path: str, status: IntegrityStatus) -> bool:
+        """
+        Backward compatibility method: Set integrity status for a file
+        
+        Args:
+            file_path: путь к файлу
+            status: новый статус целостности
+            
+        Returns:
+            True если файл найден и обновлен, False иначе
+        """
+        try:
+            with self._get_connection() as conn:
+                current_time = int(datetime.now().timestamp())
+                
+                cursor = conn.execute("""
+                    UPDATE files 
+                    SET integrity_status = ?,
+                        updated_at = ?
+                    WHERE path = ?
+                """, (status.value, current_time, file_path))
+                
+                if cursor.rowcount > 0:
+                    conn.commit()
+                    logger.debug(f"Обновлен статус целостности для {file_path}: {status.value}")
+                    return True
+                else:
+                    logger.warning(f"Файл не найден для обновления статуса: {file_path}")
+                    return False
+                    
+        except Exception as e:
+            logger.error(f"Ошибка обновления статуса целостности для {file_path}: {e}")
+            return False
 
     def get_due_files(self, current_time: Optional[int] = None, limit: int = 100) -> List[FileEntry]:
         """
