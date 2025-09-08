@@ -37,13 +37,13 @@ class TestPendingProtectionAndRecovery:
                 monitor = AudioMonitor(
                     config=config,
                     state_store=test_store.store,
-                    state_planner=test_store.store
+                    state_planner=test_store.planner
                 )
                 
                 # Discovery
                 monitor.scan_directory(str(temp_dir))
                 
-                planner = TestStatePlanner(test_store.store)
+                planner = StatePlannerFixture(test_store.store)
                 
                 # Продвинуть время для стабилизации
                 clock.advance(TEST_CONSTANTS['STABLE_WAIT_SEC'])
@@ -186,7 +186,7 @@ class TestPendingProtectionAndRecovery:
                 monitor = AudioMonitor(
                     config=config,
                     state_store=test_store.store,
-                    state_planner=test_store.store
+                    state_planner=test_store.planner
                 )
                 
                 # Discovery
@@ -202,7 +202,7 @@ class TestPendingProtectionAndRecovery:
                     next_check_at=past_time  # Уже истек
                 )
                 
-                planner = TestStatePlanner(test_store.store)
+                planner = StatePlannerFixture(test_store.store)
                 
                 # Файл должен стать due из-за истекшего timeout
                 due_files = planner.get_due_files(limit=1)
@@ -232,7 +232,7 @@ class TestPendingProtectionAndRecovery:
                 monitor = AudioMonitor(
                     config=config,
                     state_store=test_store.store,
-                    state_planner=test_store.store
+                    state_planner=test_store.planner
                 )
                 
                 # Discovery
@@ -240,7 +240,7 @@ class TestPendingProtectionAndRecovery:
                 
                 clock.advance(TEST_CONSTANTS['STABLE_WAIT_SEC'])
                 
-                planner = TestStatePlanner(test_store.store)
+                planner = StatePlannerFixture(test_store.store)
                 
                 # Два "планировщика" пытаются захватить один файл
                 due_files_1 = planner.get_due_files(limit=1)
@@ -279,7 +279,7 @@ class TestPendingProtectionAndRecovery:
                     monitor = AudioMonitor(
                         config=config,
                         state_store=test_store.store,
-                        state_planner=test_store.store
+                        state_planner=test_store.planner
                     )
                     
                     # Сбросить статус файла

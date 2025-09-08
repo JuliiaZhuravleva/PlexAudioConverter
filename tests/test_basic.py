@@ -11,96 +11,74 @@ sys.path.insert(0, str(project_root))
 
 def test_imports():
     """Тест импорта основных модулей"""
-    try:
-        from state_management.enums import IntegrityStatus, ProcessedStatus
-        from state_management.store import StateStore
-        from state_management.config import StateConfig
-        print("✅ Основные модули импортированы успешно")
-        return True
-    except ImportError as e:
-        print(f"❌ Ошибка импорта: {e}")
-        return False
+    from state_management.enums import IntegrityStatus, ProcessedStatus
+    from state_management.store import StateStore
+    from state_management.config import StateConfig
+    
+    # Assert that the imports worked (they would raise ImportError if not)
+    assert IntegrityStatus.UNKNOWN is not None
+    assert ProcessedStatus.NEW is not None
+    assert StateStore is not None
+    assert StateConfig is not None
 
 def test_fixtures():
     """Тест импорта тестовых утилит"""
-    try:
-        from tests.fixtures import (
-            TempFS, SyntheticDownloader, FakeClock, FakeIntegrityChecker, FFprobeStub,
-            StateStoreFixture, StatePlannerFixture, TEST_CONSTANTS, create_test_config,
-            create_sample_video_file, assert_metrics_equal
-        )
-        print("✅ Тестовые утилиты импортированы успешно")
-        return True
-    except ImportError as e:
-        print(f"❌ Ошибка импорта fixtures: {e}")
-        return False
+    from tests.fixtures import (
+        TempFS, SyntheticDownloader, FakeClock, FakeIntegrityChecker, FFprobeStub,
+        StateStoreFixture, StatePlannerFixture, TEST_CONSTANTS, create_test_config,
+        create_sample_video_file, assert_metrics_equal
+    )
+    
+    # Assert that the fixture imports worked
+    assert TempFS is not None
+    assert FakeClock is not None
+    assert TEST_CONSTANTS is not None
 
 def test_temp_fs():
     """Тест TempFS"""
-    try:
-        from tests.fixtures import TempFS
+    from tests.fixtures import TempFS
+    
+    with TempFS() as temp_dir:
+        test_file = temp_dir / "test.txt"
+        test_file.write_text("Hello, World!")
         
-        with TempFS() as temp_dir:
-            test_file = temp_dir / "test.txt"
-            test_file.write_text("Hello, World!")
-            
-            assert test_file.exists()
-            assert test_file.read_text() == "Hello, World!"
-            
-        print("✅ TempFS работает корректно")
-        return True
-    except Exception as e:
-        print(f"❌ Ошибка TempFS: {e}")
-        return False
+        assert test_file.exists()
+        assert test_file.read_text() == "Hello, World!"
 
 def test_state_store():
     """Тест StateStoreFixture"""
-    try:
-        from tests.fixtures import StateStoreFixture
-        from state_management.enums import IntegrityStatus, ProcessedStatus
+    from tests.fixtures import StateStoreFixture
+    from state_management.enums import IntegrityStatus, ProcessedStatus
+    
+    with StateStoreFixture() as test_store:
+        # Проверить создание базы
+        assert test_store.get_file_count() == 0
         
-        with StateStoreFixture() as test_store:
-            # Проверить создание базы
-            assert test_store.get_file_count() == 0
-            
-            # Добавить файл
-            test_store.store.upsert_file(
-                path="/test/file.mkv",
-                size_bytes=1024*1024,
-                mtime=1234567890,
-                integrity_status=IntegrityStatus.UNKNOWN,
-                processed_status=ProcessedStatus.NEW
-            )
-            
-            assert test_store.get_file_count() == 1
-            
-        print("✅ StateStoreFixture работает корректно")
-        return True
-    except Exception as e:
-        print(f"❌ Ошибка StateStoreFixture: {e}")
-        return False
+        # Добавить файл
+        test_store.store.upsert_file(
+            path="/test/file.mkv",
+            size_bytes=1024*1024,
+            mtime=1234567890,
+            integrity_status=IntegrityStatus.UNKNOWN,
+            processed_status=ProcessedStatus.NEW
+        )
+        
+        assert test_store.get_file_count() == 1
 
 def test_fake_integrity_checker():
     """Тест FakeIntegrityChecker"""
-    try:
-        from tests.fixtures import FakeIntegrityChecker
-        from state_management.enums import IntegrityStatus
-        
-        checker = FakeIntegrityChecker()
-        checker.delay_seconds = 0  # Без задержки для теста
-        
-        status, score, mode = checker.check_video_integrity("/fake/file.mkv")
-        
-        assert status == IntegrityStatus.COMPLETE
-        assert score == 1.0
-        assert mode == "quick"
-        assert checker.call_count == 1
-        
-        print("✅ FakeIntegrityChecker работает корректно")
-        return True
-    except Exception as e:
-        print(f"❌ Ошибка FakeIntegrityChecker: {e}")
-        return False
+    from tests.fixtures import FakeIntegrityChecker
+    from state_management.enums import IntegrityStatus
+    
+    checker = FakeIntegrityChecker()
+    checker.delay_seconds = 0  # Без задержки для теста
+    
+    status, score, mode = checker.check_video_integrity("/fake/file.mkv")
+    
+    assert status == IntegrityStatus.COMPLETE
+    assert score == 1.0
+    assert mode == "quick"
+    assert checker.call_count == 1
 
 def run_basic_tests():
     """Запустить все базовые тесты"""

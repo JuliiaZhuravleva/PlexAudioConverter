@@ -388,6 +388,8 @@ class MetricNames:
     INTEGRITY_BACKOFF_RESUMED = "integrity_backoff_resumed"
     INTEGRITY_FAIL_COUNT_MAX = "integrity_fail_count_max"
     QUARANTINED_FILES = "quarantined_files"
+    QUARANTINED_TOTAL = "quarantined_total"  # Total count of quarantined files (Task 5)
+    PENDING_RETRIES_TOTAL = "pending_retries_total"  # Total retry attempts (Task 5)
     SIZE_CHANGE_RESET = "size_change_reset"
     
     # Stability tracking (monotonic time based)

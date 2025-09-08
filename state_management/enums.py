@@ -15,19 +15,21 @@ class IntegrityStatus(Enum):
     COMPLETE = "COMPLETE"       # можно доверять содержимому
     INCOMPLETE = "INCOMPLETE"   # проверка не прошла
     ERROR = "ERROR"             # сбой в проверке
+    QUARANTINED = "QUARANTINED" # слишком много неудачных попыток, исключён из обработки
 
     def is_final(self) -> bool:
         """Является ли статус финальным (не требует дальнейших проверок)"""
-        return self in {self.COMPLETE, self.INCOMPLETE, self.ERROR}
+        return self in {self.COMPLETE, self.INCOMPLETE, self.ERROR, self.QUARANTINED}
 
     def can_transition_to(self, target: 'IntegrityStatus') -> bool:
         """Может ли состояние перейти в целевое"""
         valid_transitions = {
-            self.UNKNOWN: {self.PENDING, self.ERROR},
-            self.PENDING: {self.COMPLETE, self.INCOMPLETE, self.ERROR},
+            self.UNKNOWN: {self.PENDING, self.ERROR, self.QUARANTINED},
+            self.PENDING: {self.COMPLETE, self.INCOMPLETE, self.ERROR, self.QUARANTINED},
             self.COMPLETE: {self.PENDING, self.ERROR},  # может потребоваться перепроверка
-            self.INCOMPLETE: {self.PENDING, self.ERROR},
-            self.ERROR: {self.PENDING, self.UNKNOWN}  # можно попробовать снова
+            self.INCOMPLETE: {self.PENDING, self.ERROR, self.QUARANTINED},
+            self.ERROR: {self.PENDING, self.UNKNOWN, self.QUARANTINED},  # можно попробовать снова или исключить
+            self.QUARANTINED: set()  # финальный статус, выхода нет
         }
         return target in valid_transitions.get(self, set())
 

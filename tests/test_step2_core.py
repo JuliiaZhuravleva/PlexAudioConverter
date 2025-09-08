@@ -39,11 +39,11 @@ class TestDiscoveryAndPlanning:
                 monitor = AudioMonitor(
                     config=config,
                     state_store=test_store.store,
-                    state_planner=test_store.store
+                    state_planner=test_store.planner
                 )
                 
                 # Запустить один цикл discovery
-                monitor.find_new_files(str(temp_dir))
+                monitor.scan_directory(str(temp_dir))
                 
                 # Проверить создание записи
                 test_store.assert_file_exists(
@@ -83,11 +83,11 @@ class TestDiscoveryAndPlanning:
                 monitor = AudioMonitor(
                     config=config,
                     state_store=test_store.store,
-                    state_planner=test_store.store
+                    state_planner=test_store.planner
                 )
                 
                 # Discovery всех файлов
-                monitor.find_new_files(str(temp_dir))
+                monitor.scan_directory(str(temp_dir))
                 
                 # Проверить что все файлы в базе
                 assert test_store.get_file_count() == 5
@@ -128,7 +128,7 @@ class TestDiscoveryAndPlanning:
             monitor = AudioMonitor(
                 config=config,
                 state_store=test_store.store,
-                state_planner=test_store.store
+                state_planner=test_store.planner
             )
             
             planner = StatePlannerFixture(test_store.store)
@@ -170,11 +170,11 @@ class TestDiscoveryAndPlanning:
             monitor = AudioMonitor(
                 config=config,
                 state_store=test_store.store,
-                state_planner=test_store.store
+                state_planner=test_store.planner
             )
             
             # Discovery
-            monitor.find_new_files(str(temp_dir))
+            monitor.scan_directory(str(temp_dir))
             
             # Проверить детекцию is_stereo
             original_data = test_store.get_file_by_path(str(original_file))
@@ -199,16 +199,16 @@ class TestDiscoveryAndPlanning:
             monitor = AudioMonitor(
                 config=config,
                 state_store=test_store.store,
-                state_planner=test_store.store
+                state_planner=test_store.planner
             )
             
             # Первый discovery
-            monitor.find_new_files(str(temp_dir))
+            monitor.scan_directory(str(temp_dir))
             first_count = test_store.get_file_count()
             first_data = test_store.get_file_by_path(str(video_file))
             
             # Второй discovery того же файла
-            monitor.find_new_files(str(temp_dir))
+            monitor.scan_directory(str(temp_dir))
             second_count = test_store.get_file_count()
             second_data = test_store.get_file_by_path(str(video_file))
             
@@ -236,11 +236,11 @@ class TestDiscoveryAndPlanning:
                 monitor = AudioMonitor(
                     config=config,
                     state_store=test_store.store,
-                    state_planner=test_store.store
+                    state_planner=test_store.planner
                 )
                 
                 # Discovery
-                monitor.find_new_files(str(temp_dir))
+                monitor.scan_directory(str(temp_dir))
                 
                 # Получить файл для обработки
                 due_files = test_store.store.get_due_files(limit=1)

@@ -10,7 +10,7 @@ from unittest.mock import patch
 from tests.fixtures import (
     TempFS, SyntheticDownloader, FakeClock, FakeIntegrityChecker, FFprobeStub,
     StateStoreFixture, StatePlannerFixture, TEST_CONSTANTS, create_test_config,
-    create_sample_video_file, assert_metrics_equal
+    create_test_config_manager, create_sample_video_file, assert_metrics_equal
 )
 from state_management.enums import IntegrityStatus, ProcessedStatus
 from core.audio_monitor import AudioMonitor
@@ -68,11 +68,11 @@ class TestReliabilityAndMaintenance:
             for filename in ["legacy1.mkv", "legacy2.mkv", "legacy3.mkv"]:
                 create_sample_video_file(temp_dir / filename, size_mb=50)
             
-            config = create_test_config()
+            config = create_test_config_manager()
             monitor = AudioMonitor(
                 config=config,
                 state_store=test_store.store,
-                state_planner=test_store.store
+                state_planner=test_store.planner
             )
             
             # Запустить миграцию (когда будет реализована)
@@ -91,11 +91,11 @@ class TestReliabilityAndMaintenance:
             video_file = temp_dir / "will_be_deleted.mkv"
             create_sample_video_file(video_file, size_mb=50)
             
-            config = create_test_config()
+            config = create_test_config_manager()
             monitor = AudioMonitor(
                 config=config,
                 state_store=test_store.store,
-                state_planner=test_store.store
+                state_planner=test_store.planner
             )
             
             # Discovery файла
@@ -118,11 +118,11 @@ class TestReliabilityAndMaintenance:
     def test_database_integrity_after_operations(self):
         """Тест целостности базы данных после различных операций"""
         with TempFS() as temp_dir, StateStoreFixture() as test_store:
-            config = create_test_config()
+            config = create_test_config_manager()
             monitor = AudioMonitor(
                 config=config,
                 state_store=test_store.store,
-                state_planner=test_store.store
+                state_planner=test_store.planner
             )
             
             # Создать файлы

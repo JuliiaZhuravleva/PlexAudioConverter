@@ -34,7 +34,7 @@ class TestFileOperations:
                 monitor = AudioMonitor(
                     config=config,
                     state_store=test_store.store,
-                    state_planner=test_store.store
+                    state_planner=test_store.planner
                 )
                 
                 # Начать "скачивание" во временный файл
@@ -106,7 +106,7 @@ class TestFileOperations:
                 monitor = AudioMonitor(
                     config=config,
                     state_store=test_store.store,
-                    state_planner=test_store.store
+                    state_planner=test_store.planner
                 )
                 
                 # Создать файл и начать "скачивание"
@@ -128,7 +128,7 @@ class TestFileOperations:
                 downloader.delete()
                 
                 # Запустить планировщик
-                planner = TestStatePlanner(test_store.store)
+                planner = StatePlannerFixture(test_store.store)
                 due_files = planner.get_due_files(limit=1)
                 
                 if due_files:
@@ -166,7 +166,7 @@ class TestFileOperations:
                 monitor = AudioMonitor(
                     config=config,
                     state_store=test_store.store,
-                    state_planner=test_store.store
+                    state_planner=test_store.planner
                 )
                 
                 # Создать первый файл
@@ -222,7 +222,7 @@ class TestFileOperations:
                 monitor = AudioMonitor(
                     config=config,
                     state_store=test_store.store,
-                    state_planner=test_store.store
+                    state_planner=test_store.planner
                 )
                 
                 # Discovery и стабилизация
@@ -268,7 +268,7 @@ class TestFileOperations:
             monitor = AudioMonitor(
                 config=config,
                 state_store=test_store.store,
-                state_planner=test_store.store
+                state_planner=test_store.planner
             )
             
             # Создать файл с метаданными
@@ -309,17 +309,17 @@ class TestFileOperations:
             monitor = AudioMonitor(
                 config=config,
                 state_store=test_store.store,
-                state_planner=test_store.store
+                state_planner=test_store.planner
             )
             
-            # Создать два файла
+            # Создать два файла с разным начальным содержимым
             downloader1 = SyntheticDownloader(file1)
             downloader1.start_download()
-            downloader1.append(b'\x00' * 1024 * 1024)
+            downloader1.append(b'\x01' * 1024 * 1024)  # File 1 starts with 0x01
             
             downloader2 = SyntheticDownloader(file2)
             downloader2.start_download()
-            downloader2.append(b'\x00' * 2 * 1024 * 1024)
+            downloader2.append(b'\x02' * 2 * 1024 * 1024)  # File 2 starts with 0x02
             
             # Discovery
             monitor.scan_directory(str(temp_dir))

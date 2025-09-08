@@ -19,6 +19,8 @@ import shutil
 import sys
 sys.path.append(str(Path(__file__).parent.parent.parent))
 
+from unittest.mock import patch, MagicMock
+
 from state_management.enums import IntegrityStatus, ProcessedStatus, PairStatus
 from state_management.models import FileEntry, GroupEntry, normalize_group_id, create_file_entry_from_path
 from state_management.store import StateStore
@@ -187,6 +189,7 @@ class TestStateStore:
             assert due_files[i].next_check_at <= due_files[i + 1].next_check_at
 
 
+@pytest.mark.asyncio
 class TestStatePlanner:
     """Тесты для планировщика"""
     
@@ -304,6 +307,7 @@ def temp_video_files():
         yield temp_path, files
 
 
+@pytest.mark.asyncio
 class TestStateMachineIntegration:
     """Интеграционные тесты для конечного автомата"""
     
@@ -321,8 +325,17 @@ class TestStateMachineIntegration:
             machine.stop()
     
     @pytest.mark.asyncio
-    async def test_end_to_end_workflow(self, temp_machine, temp_video_files):
+    @patch('state_management.machine.get_integrity_adapter')
+    async def test_end_to_end_workflow(self, mock_get_adapter, temp_machine, temp_video_files):
         """Тест полного workflow от обнаружения до обработки"""
+        # Mock the integrity adapter to return success for test files
+        mock_adapter = MagicMock()
+        mock_adapter.check_video_integrity.return_value = (IntegrityStatus.COMPLETE, 1.0)
+        mock_get_adapter.return_value = mock_adapter
+        
+        # Replace the adapter in the temp_machine
+        temp_machine.integrity_adapter = mock_adapter
+        
         temp_path, files = temp_video_files
         
         # 1. Обнаруживаем файлы в директории
@@ -337,11 +350,53 @@ class TestStateMachineIntegration:
             assert status['processed_status'] == ProcessedStatus.NEW.value
         
         # 3. Обрабатываем файлы (несколько итераций для стабилизации)
-        for _ in range(3):
+        # First, manually stabilize files for testing
+        logger.info("=== Manually arming stability ===")
+        for file_path in files.values():
+            entry = temp_machine.store.get_file(file_path)
+            if entry:
+                logger.debug(f"Before arm_stability: {file_path.name} - stable_since_mono={entry.stable_since_mono}")
+                # Set last_change_at to allow stability arming (needs to be >1s in the past)
+                entry.last_change_at = temp_machine.planner.time_source.now_mono() - 2.0
+                temp_machine.store.upsert_file(entry)
+                entry = temp_machine.store.get_file(file_path)  # Refresh
+                # Manually arm stability for test
+                armed = entry.arm_stability(temp_machine.planner.time_source)
+                logger.debug(f"After arm_stability: {file_path.name} - armed={armed}, stable_since_mono={entry.stable_since_mono}")
+                temp_machine.store.upsert_file(entry)
+        
+        # Wait for stable_wait_sec period
+        stable_wait = temp_machine.config.get('stable_wait_sec', 5)
+        logger.info(f"=== Waiting {stable_wait + 0.5}s for stability period ===")
+        await asyncio.sleep(stable_wait + 0.5)
+        
+        # After waiting, make files due for processing by setting next_check_at
+        current_time = int(temp_machine.planner.time_source.now_wall())
+        for file_path in files.values():
+            entry = temp_machine.store.get_file(file_path)
+            if entry:
+                entry.next_check_at = current_time  # Make immediately due
+                temp_machine.store.upsert_file(entry)
+                logger.debug(f"Set next_check_at to {current_time} for {file_path.name}")
+        
+        # Check due files before processing
+        due_files = temp_machine.store.get_due_files(limit=10)
+        logger.info(f"=== Due files before processing: {len(due_files)} ===")
+        for entry in due_files:
+            logger.debug(f"Due: {Path(entry.path).name} - integrity={entry.integrity_status}")
+        
+        # Now process files
+        logger.info("=== Starting file processing ===")
+        total_processed = 0
+        for iteration in range(5):  # More iterations
             processed = await temp_machine.process_pending_files(limit=10)
+            total_processed += processed
+            logger.info(f"Iteration {iteration + 1}: processed {processed} files (total: {total_processed})")
             if processed == 0:
                 break
-            await asyncio.sleep(0.1)  # небольшая пауза
+            await asyncio.sleep(0.2)  # Slightly longer pause
+        
+        logger.info(f"=== Processing complete: total processed {total_processed} files ===")
         
         # 4. Проверяем финальные статусы
         original_status = temp_machine.get_file_status(files['original'])

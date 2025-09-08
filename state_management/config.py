@@ -29,6 +29,7 @@ class StateConfig:
     # Backoff для повторных попыток
     backoff_step_sec: int = 30
     backoff_max_sec: int = 600
+    quarantine_threshold: int = 5  # После этого количества неудач файл помечается как QUARANTINED
     
     # Ограничения памяти
     max_state_entries: int = 5000
@@ -68,9 +69,10 @@ class StateConfig:
     ffprobe_path: str = "ffprobe"
     ffmpeg_path: str = "ffmpeg"
     
-    # Поддерживаемые видео форматы
+    # Поддерживаемые видео форматы (включая временные расширения для отслеживания переименований)
     video_extensions: list = field(default_factory=lambda: [
-        '.mp4', '.mkv', '.avi', '.mov', '.m4v', '.wmv', '.flv', '.webm'
+        '.mp4', '.mkv', '.avi', '.mov', '.m4v', '.wmv', '.flv', '.webm',
+        '.tmp', '.part', '.download'  # Temporary extensions for rename tracking
     ])
     
     # Настройки конвертации (будут использоваться в следующих версиях)
@@ -137,6 +139,9 @@ class StateConfig:
         
         if self.backoff_max_sec < self.backoff_step_sec:
             errors.append("backoff_max_sec должен быть >= backoff_step_sec")
+        
+        if self.quarantine_threshold < 2:
+            errors.append("quarantine_threshold должен быть >= 2")
         
         # Проверяем лимиты
         if self.max_state_entries < 100:

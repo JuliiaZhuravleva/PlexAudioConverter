@@ -6,6 +6,8 @@ FileEntry и GroupEntry - основные сущности системы уч�
 
 import json
 import hashlib
+import os
+import platform
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +30,11 @@ class FileEntry:
     group_id: str = ""
     is_stereo: bool = False
     
+    # File identity fields for rename tracking
+    file_device: Optional[int] = None  # Device ID (POSIX) or Volume serial (Windows)
+    file_inode: Optional[int] = None   # Inode (POSIX) or File index (Windows)
+    file_identity: Optional[str] = None  # Fallback: hash-based identity for tests
+    
     # Метаданные файла
     size_bytes: int = 0
     mtime: int = 0  # epoch seconds (wall time)
@@ -48,6 +55,10 @@ class FileEntry:
     # Статус обработки
     processed_status: ProcessedStatus = ProcessedStatus.NEW
     has_en2: Optional[bool] = None  # есть ли английская 2.0 дорожка
+    
+    # Lease management for PENDING protection
+    pending_owner: Optional[str] = None  # Worker/process ID that owns the lease
+    pending_expires_at: Optional[float] = None  # Monotonic time when lease expires
     
     # Дополнительные поля
     last_error: Optional[str] = None
@@ -246,6 +257,8 @@ class FileEntry:
         # Проверяем, прошла ли секунда с последнего изменения (минимальная задержка)
         if (now_mono - self.last_change_at) >= 1.0:
             self.stable_since_mono = now_mono
+            # Set legacy stable_since for backward compatibility
+            self.stable_since = int(time_source.now_wall())
             self.updated_at = int(time_source.now_wall())
             return True
         
@@ -453,13 +466,17 @@ def create_file_entry_from_path(file_path: Union[str, Path],
     
     stat = path.stat()
     group_id, is_stereo = normalize_group_id(path)
+    device, inode, identity = get_file_identity(path)
     
     entry = FileEntry(
         path=str(path),
         group_id=group_id,
         is_stereo=is_stereo,
         size_bytes=stat.st_size,
-        mtime=int(stat.st_mtime)
+        mtime=int(stat.st_mtime),
+        file_device=device,
+        file_inode=inode,
+        file_identity=identity
     )
     
     return entry
@@ -480,3 +497,71 @@ def create_group_entry(group_id: str, delete_original: bool = False) -> GroupEnt
         group_id=group_id,
         delete_original=delete_original
     )
+
+
+def get_file_identity(file_path: Union[str, Path]) -> tuple[Optional[int], Optional[int], Optional[str]]:
+    """
+    Get file identity for rename tracking
+    
+    Returns:
+        tuple[device, inode, fallback_identity]
+        - device/inode for POSIX systems
+        - None, None, hash_identity for tests/fallback
+    """
+    file_path = Path(file_path)
+    
+    if not file_path.exists():
+        return None, None, None
+    
+    try:
+        stat = file_path.stat()
+        
+        if platform.system() != 'Windows':
+            # POSIX: use device and inode
+            return int(stat.st_dev), int(stat.st_ino), None
+        else:
+            # Windows: try to get file index and volume serial
+            # For now, use fallback method since getting Windows file ID is complex
+            fallback_identity = _get_fallback_identity(file_path, stat)
+            return None, None, fallback_identity
+            
+    except (OSError, AttributeError):
+        # Fallback to hash-based identity
+        fallback_identity = _get_fallback_identity(file_path, None)
+        return None, None, fallback_identity
+
+
+def _get_fallback_identity(file_path: Path, stat: Optional[os.stat_result] = None) -> str:
+    """
+    Generate hash-based file identity for fallback/tests
+    
+    Uses only initial content to create a stable identity across renames and file modifications
+    This ensures identity remains stable during download processes where size/mtime change
+    """
+    if stat is None:
+        try:
+            stat = file_path.stat()
+        except OSError:
+            return hashlib.md5(str(file_path).encode('utf-8')).hexdigest()
+    
+    # Use only the first chunk of content for stable identity
+    # This remains stable even as file grows during download
+    try:
+        # Read first 4KB of file content for stable identity across file modifications
+        with open(file_path, 'rb') as f:
+            content_sample = f.read(4096)
+        
+        # If file is empty or very small, include the filename for uniqueness
+        if len(content_sample) == 0:
+            fallback = hashlib.md5(file_path.name.encode('utf-8')).hexdigest()
+            return fallback
+        
+        # For stable identity during downloads, use only initial content
+        # This remains stable across renames and file modifications
+        # DO NOT include size, mtime, or path as they change during active downloads/renames
+        content_hash = hashlib.md5(content_sample).hexdigest()
+        return content_hash
+        
+    except (OSError, IOError):
+        # Fallback to filename-based identity
+        return hashlib.md5(file_path.name.encode('utf-8')).hexdigest()

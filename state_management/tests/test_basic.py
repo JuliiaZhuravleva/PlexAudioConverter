@@ -13,6 +13,7 @@ from pathlib import Path
 from datetime import datetime
 import sqlite3
 import json
+import pytest
 
 # Импортируем компоненты системы
 from ..store import StateStore
@@ -23,6 +24,7 @@ from ..models import FileEntry
 from ..enums import IntegrityStatus, ProcessedStatus
 
 
+@pytest.mark.asyncio
 async def test_basic_lifecycle():
     """Базовый тест жизненного цикла файла"""
     print("TEST 1: Базовый жизненный цикл файла")
@@ -82,6 +84,7 @@ async def test_basic_lifecycle():
             shutil.rmtree(temp_dir)
 
 
+@pytest.mark.asyncio
 async def test_size_change_reset():
     """Тест сброса цикла при изменении размера"""
     print("\nTEST 2: Сброс цикла при изменении размера")

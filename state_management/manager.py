@@ -529,21 +529,36 @@ class StateManager:
         # Get file stats
         stat = file_path.stat()
         
+        # Generate group_id, detect is_stereo, and get file identity
+        from .models import normalize_group_id, get_file_identity
+        group_id, is_stereo = normalize_group_id(file_path)
+        device, inode, identity = get_file_identity(file_path)
+        
         # Create FileEntry
+        current_time = int(time.time())
         entry = FileEntry(
             path=str(file_path.absolute()),
+            group_id=group_id,
             size_bytes=int(stat.st_size),
             mtime=int(stat.st_mtime),
             integrity_status=IntegrityStatus.UNKNOWN,
             processed_status=ProcessedStatus.NEW,
-            first_seen_at=int(time.time()),
-            next_check_at=int(time.time()),  # Immediately due
-            is_stereo='.stereo.' in file_path.name.lower()
+            first_seen_at=current_time,
+            next_check_at=current_time,  # Immediately due
+            last_change_at=int(stat.st_mtime),  # Set based on file mtime
+            is_stereo=is_stereo,
+            file_device=device,
+            file_inode=inode,
+            file_identity=identity
         )
         
         # Store in database
         stored_entry = self.state_machine.store.upsert_file(entry)
         logger.debug(f"Registered file: {file_path} (ID: {stored_entry.id})")
+        
+        # Update group presence
+        if group_id:
+            self.state_machine.store.update_group_presence(group_id, delete_original=False)
         
         return stored_entry
 

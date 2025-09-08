@@ -6,6 +6,8 @@ import tempfile
 import shutil
 import os
 import time
+import asyncio
+import sys
 from pathlib import Path
 from typing import Dict, Any, Optional
 from unittest.mock import Mock, patch
@@ -16,6 +18,35 @@ from tests.fixtures import (
     create_test_config, create_test_config_manager, create_sample_video_file
 )
 from state_management.enums import IntegrityStatus, ProcessedStatus
+
+
+# Cross-platform event loop policy for consistent async behavior
+@pytest.fixture(scope="session")
+def event_loop_policy():
+    """Set cross-platform event loop policy for consistent async test behavior"""
+    if sys.platform == "win32":
+        # Use ProactorEventLoop on Windows for better subprocess/file handling
+        policy = asyncio.WindowsProactorEventLoopPolicy()
+    else:
+        # Use default selector event loop on Unix systems  
+        policy = asyncio.DefaultEventLoopPolicy()
+    
+    old_policy = asyncio.get_event_loop_policy()
+    asyncio.set_event_loop_policy(policy)
+    
+    yield policy
+    
+    # Restore original policy
+    asyncio.set_event_loop_policy(old_policy)
+
+
+@pytest.fixture(scope="function")
+def event_loop(event_loop_policy):
+    """Create a new event loop for each test"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    yield loop
+    loop.close()
 
 
 @pytest.fixture

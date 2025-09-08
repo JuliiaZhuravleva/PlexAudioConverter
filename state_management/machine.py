@@ -89,13 +89,21 @@ class AudioStateMachine:
             try:
                 logger.debug(f"Проверка целостности: {file_path.name}")
                 
-                # Устанавливаем статус PENDING
-                entry.update_integrity_status(IntegrityStatus.PENDING)
-                
-                # Планируем timeout
+                # Атомарный переход UNKNOWN -> PENDING с таймаутом
                 timeout_delay = self.config['integrity_timeout_sec']
-                entry.schedule_next_check(timeout_delay)
-                self.store.upsert_file(entry)
+                next_timeout = int(datetime.now().timestamp()) + timeout_delay
+                
+                success = self.store.transition_integrity_status(
+                    file_path,
+                    IntegrityStatus.UNKNOWN,
+                    IntegrityStatus.PENDING,
+                    next_check_at=next_timeout
+                )
+                
+                if not success:
+                    # Файл уже не в состоянии UNKNOWN (возможно, обрабатывается другим процессом)
+                    logger.debug(f"Файл не в состоянии UNKNOWN: {file_path.name}")
+                    return False
                 
                 # Выполняем проверку
                 mode = IntegrityMode.QUICK if self.config['integrity_quick_mode'] else IntegrityMode.FULL
@@ -108,44 +116,78 @@ class AudioStateMachine:
                     mode
                 )
                 
-                # Обрабатываем результат
+                # Атомарный переход к финальному состоянию
+                current_time = int(datetime.now().timestamp())
+                
                 if status == IntegrityStatus.COMPLETE:
-                    metrics.increment(MetricNames.INTEGRITY_PASS)
-                    entry.update_integrity_status(
+                    # PENDING -> COMPLETE
+                    success = self.store.transition_integrity_status(
+                        file_path,
+                        IntegrityStatus.PENDING,
                         IntegrityStatus.COMPLETE,
-                        score=score,
-                        mode=mode
+                        next_check_at=current_time,  # Готов к следующему шагу
+                        score=score
                     )
                     
-                    # Планируем следующий шаг (анализ аудио)
-                    entry.next_check_at = int(datetime.now().timestamp())
+                    if success:
+                        metrics.increment(MetricNames.INTEGRITY_PASS)
+                        logger.info(f"Целостность подтверждена: {file_path.name} (score: {score:.2f})" if score else f"Целостность подтверждена: {file_path.name}")
                     
-                    logger.info(f"Целостность подтверждена: {file_path.name} (score: {score:.2f})" if score else f"Целостность подтверждена: {file_path.name}")
+                elif status in [IntegrityStatus.INCOMPLETE, IntegrityStatus.ERROR]:
+                    # PENDING -> INCOMPLETE/ERROR с backoff
+                    backoff_delay = await self._calculate_backoff_delay(entry)
+                    next_check = current_time + backoff_delay
                     
+                    success = self.store.transition_integrity_status(
+                        file_path,
+                        IntegrityStatus.PENDING,
+                        status,
+                        next_check_at=next_check,
+                        error=f'Статус целостности: {status.value}',
+                        fail_count_increment=1
+                    )
+                    
+                    if success:
+                        metrics.increment(MetricNames.INTEGRITY_FAIL)
+                        logger.warning(f"Проблемы с целостностью: {file_path.name} - {status.value}, повтор через {backoff_delay}s")
                 else:
-                    metrics.increment(MetricNames.INTEGRITY_FAIL)
-                    error_msg = f'Статус целостности: {status.value}'
-                    
-                    entry.update_integrity_status(status, error=error_msg)
-                    
-                    # Применяем backoff
-                    await self.planner.apply_backoff(entry)
-                    
-                    logger.warning(f"Проблемы с целостностью: {file_path.name} - {error_msg}")
+                    # Неожиданный статус
+                    logger.error(f"Неожиданный статус целостности: {status}")
+                    success = False
                 
-                self.store.upsert_file(entry)
-                return True
+                return success
                 
             except Exception as e:
+                # Откатываем состояние к ERROR при исключении
+                try:
+                    backoff_delay = 300  # 5 минут по умолчанию
+                    next_check = int(datetime.now().timestamp()) + backoff_delay
+                    
+                    self.store.transition_integrity_status(
+                        file_path,
+                        IntegrityStatus.PENDING,
+                        IntegrityStatus.ERROR,
+                        next_check_at=next_check,
+                        error=str(e),
+                        fail_count_increment=1
+                    )
+                except Exception as rollback_error:
+                    logger.error(f"Ошибка отката статуса: {rollback_error}")
+                
                 metrics.increment(MetricNames.INTEGRITY_ERROR)
                 logger.error(f"Ошибка проверки целостности {file_path}: {e}")
-                
-                # Устанавливаем статус ERROR
-                entry.update_integrity_status(IntegrityStatus.ERROR, error=str(e))
-                await self.planner.apply_backoff(entry)
-                self.store.upsert_file(entry)
-                
                 return False
+
+    async def _calculate_backoff_delay(self, entry: FileEntry) -> int:
+        """Вычисление задержки backoff для файла"""
+        backoff_step = self.config.get('backoff_step_sec', 30)
+        backoff_max = self.config.get('backoff_max_sec', 600)
+        
+        # Линейный backoff: step, 2*step, 3*step, ..., max
+        multiplier = min(max(1, entry.integrity_fail_count + 1), backoff_max // backoff_step)
+        delay = min(backoff_step * multiplier, backoff_max)
+        
+        return delay
 
     async def _handle_audio_analysis(self, task: PlannerTask) -> bool:
         """Обработка анализа аудиодорожек"""
