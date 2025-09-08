@@ -7,6 +7,8 @@ State Store - Хранилище состояний на базе SQLite
 import sqlite3
 import json
 import logging
+import uuid
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Union, Tuple
@@ -27,6 +29,10 @@ class StateStoreError(Exception):
 
 class StateStore:
     """SQLite-хранилище для управления состояниями файлов и групп"""
+    
+    # Lease management constants
+    LEASE_TIMEOUT_SECONDS = 300.0  # 5 minutes default lease timeout
+    _worker_id_cache = None  # Cache for worker ID
     
     # SQL-схемы
     SCHEMA_FILES = """
@@ -50,7 +56,12 @@ class StateStore:
             extra TEXT,
             updated_at INTEGER NOT NULL,
             last_change_at REAL,
-            stable_since_mono REAL
+            stable_since_mono REAL,
+            file_device INTEGER,
+            file_inode INTEGER,
+            file_identity TEXT,
+            pending_owner TEXT,
+            pending_expires_at REAL
         )
     """
     
@@ -70,6 +81,8 @@ class StateStore:
     INDEXES = [
         "CREATE INDEX IF NOT EXISTS idx_files_next ON files(next_check_at)",
         "CREATE INDEX IF NOT EXISTS idx_files_group ON files(group_id)",
+        "CREATE INDEX IF NOT EXISTS idx_files_identity ON files(file_device, file_inode)",
+        "CREATE INDEX IF NOT EXISTS idx_files_identity_str ON files(file_identity)",
         "CREATE INDEX IF NOT EXISTS idx_files_status ON files(processed_status)",
         "CREATE INDEX IF NOT EXISTS idx_files_integrity ON files(integrity_status)",
         "CREATE INDEX IF NOT EXISTS idx_groups_processed ON groups(processed_status)",
@@ -98,6 +111,15 @@ class StateStore:
         # Выполняем миграцию для новых полей monotonic time
         self._migrate_monotonic_fields()
         
+        # Выполняем миграцию для полей file identity
+        self._migrate_identity_fields()
+        
+        # Выполняем миграцию для полей lease management
+        self._migrate_lease_fields()
+        
+        # Создаем индексы после всех миграций
+        self._create_indexes()
+        
         logger.info(f"StateStore инициализирован: {self.db_path_str}")
 
     def _init_database(self):
@@ -107,9 +129,17 @@ class StateStore:
             conn.execute(self.SCHEMA_FILES)
             conn.execute(self.SCHEMA_GROUPS)
             
-            # Создаем индексы
+            conn.commit()
+
+    def _create_indexes(self):
+        """Создание индексов после миграций"""
+        with self._get_connection() as conn:
             for index_sql in self.INDEXES:
-                conn.execute(index_sql)
+                try:
+                    conn.execute(index_sql)
+                except sqlite3.OperationalError as e:
+                    if "already exists" not in str(e):
+                        logger.warning(f"Не удалось создать индекс: {e}")
             
             conn.commit()
 
@@ -128,6 +158,60 @@ class StateStore:
             if 'stable_since_mono' not in columns:
                 conn.execute("ALTER TABLE files ADD COLUMN stable_since_mono REAL")
                 logger.info("Добавлено поле stable_since_mono в таблицу files")
+            
+            conn.commit()
+
+    def _migrate_identity_fields(self):
+        """Миграция для добавления полей file identity"""
+        with self._get_connection() as conn:
+            # Проверяем, существуют ли новые поля
+            cursor = conn.execute("PRAGMA table_info(files)")
+            columns = {row[1] for row in cursor.fetchall()}
+            
+            # Добавляем новые поля если их нет
+            if 'file_device' not in columns:
+                conn.execute("ALTER TABLE files ADD COLUMN file_device INTEGER")
+                logger.info("Добавлено поле file_device в таблицу files")
+            
+            if 'file_inode' not in columns:
+                conn.execute("ALTER TABLE files ADD COLUMN file_inode INTEGER")
+                logger.info("Добавлено поле file_inode в таблицу files")
+                
+            if 'file_identity' not in columns:
+                conn.execute("ALTER TABLE files ADD COLUMN file_identity TEXT")
+                logger.info("Добавлено поле file_identity в таблицу files")
+            
+            # Создаем индексы для новых полей если их нет
+            try:
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_files_identity ON files(file_device, file_inode)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_files_identity_str ON files(file_identity)")
+            except Exception as e:
+                logger.warning(f"Could not create identity indexes: {e}")
+            
+            conn.commit()
+
+    def _migrate_lease_fields(self):
+        """Миграция для добавления полей lease management"""
+        with self._get_connection() as conn:
+            # Проверяем, существуют ли новые поля
+            cursor = conn.execute("PRAGMA table_info(files)")
+            columns = {row[1] for row in cursor.fetchall()}
+            
+            # Добавляем новые поля если их нет
+            if 'pending_owner' not in columns:
+                conn.execute("ALTER TABLE files ADD COLUMN pending_owner TEXT")
+                logger.info("Добавлено поле pending_owner в таблицу files")
+            
+            if 'pending_expires_at' not in columns:
+                conn.execute("ALTER TABLE files ADD COLUMN pending_expires_at REAL")
+                logger.info("Добавлено поле pending_expires_at в таблицу files")
+            
+            # Создаем индекс для эффективности lease queries
+            try:
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_files_pending ON files(pending_owner, pending_expires_at)")
+                logger.debug("Создан индекс idx_files_pending для таблицы files")
+            except sqlite3.OperationalError:
+                pass  # Индекс уже существует
             
             conn.commit()
 
@@ -220,7 +304,12 @@ class StateStore:
             extra_json,
             entry.updated_at,
             entry.last_change_at,
-            entry.stable_since_mono
+            entry.stable_since_mono,
+            entry.file_device,
+            entry.file_inode,
+            entry.file_identity,
+            entry.pending_owner,
+            entry.pending_expires_at
         )
 
     def _group_entry_to_values(self, entry: GroupEntry) -> Tuple:
@@ -330,8 +419,9 @@ class StateStore:
                             first_seen_at, stable_since, next_check_at,
                             integrity_status, integrity_score, integrity_mode_used,
                             integrity_fail_count, processed_status, has_en2,
-                            last_error, extra, updated_at, last_change_at, stable_since_mono
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            last_error, extra, updated_at, last_change_at, stable_since_mono,
+                            file_device, file_inode, file_identity, pending_owner, pending_expires_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(path) DO UPDATE SET
                             group_id = excluded.group_id,
                             is_stereo = excluded.is_stereo,
@@ -349,7 +439,12 @@ class StateStore:
                             extra = excluded.extra,
                             updated_at = excluded.updated_at,
                             last_change_at = excluded.last_change_at,
-                            stable_since_mono = excluded.stable_since_mono
+                            stable_since_mono = excluded.stable_since_mono,
+                            file_device = excluded.file_device,
+                            file_inode = excluded.file_inode,
+                            file_identity = excluded.file_identity,
+                            pending_owner = excluded.pending_owner,
+                            pending_expires_at = excluded.pending_expires_at
                     """, self._file_entry_to_values(entry))
                     
                     # Получаем ID записи (или новой, или обновленной)
@@ -364,7 +459,9 @@ class StateStore:
                             first_seen_at = ?, stable_since = ?, next_check_at = ?,
                             integrity_status = ?, integrity_score = ?, integrity_mode_used = ?,
                             integrity_fail_count = ?, processed_status = ?, has_en2 = ?,
-                            last_error = ?, extra = ?, updated_at = ?, last_change_at = ?, stable_since_mono = ?
+                            last_error = ?, extra = ?, updated_at = ?, last_change_at = ?, stable_since_mono = ?,
+                            file_device = ?, file_inode = ?, file_identity = ?,
+                            pending_owner = ?, pending_expires_at = ?
                         WHERE id = ?
                     """, self._file_entry_to_values(entry) + (entry.id,))
                 
@@ -422,12 +519,13 @@ class StateStore:
             logger.error(f"Ошибка обновления размера файла {file_path}: {e}")
             return False
 
-    def check_stability_and_schedule(self, file_path: str) -> bool:
+    def check_stability_and_schedule(self, file_path: str, stable_wait_sec: int = 30) -> bool:
         """
         Backward compatibility method: Check file stability and schedule for processing if stable
         
         Args:
             file_path: путь к файлу
+            stable_wait_sec: время ожидания стабильности (по умолчанию 30 секунд)
             
         Returns:
             True if file became stable, False otherwise
@@ -454,19 +552,18 @@ class StateStore:
                     return True
                 
                 # Check if enough time has passed since last change
-                # Default to 30 seconds if last_change_at is None
-                stable_wait_sec = 30  # This should come from config but use default for compatibility
                 time_since_change = current_time - (last_change_at or current_time)
                 
                 if time_since_change >= stable_wait_sec:
                     # Mark as stable and schedule for immediate processing
+                    # Set next_check_at to current_time - 10 to ensure it's definitely due
                     conn.execute("""
                         UPDATE files 
                         SET stable_since = ?,
                             next_check_at = ?,
                             updated_at = ?
                         WHERE id = ?
-                    """, (current_time, current_time, current_time, file_id))
+                    """, (current_time, current_time - 10, current_time, file_id))
                     
                     conn.commit()
                     logger.debug(f"Файл стабилизировался и запланирован: {file_path}")
@@ -512,10 +609,95 @@ class StateStore:
         except Exception as e:
             logger.error(f"Ошибка обновления статуса целостности для {file_path}: {e}")
             return False
+            
+    def transition_integrity_status(self, file_path: Union[str, Path], from_status: IntegrityStatus, 
+                                   to_status: IntegrityStatus, next_check_at: Optional[int] = None,
+                                   score: Optional[float] = None, error: Optional[str] = None,
+                                   fail_count_increment: int = 0) -> bool:
+        """
+        Атомарный переход статуса целостности с проверкой исходного состояния
+        
+        Args:
+            file_path: путь к файлу
+            from_status: ожидаемый текущий статус
+            to_status: новый статус
+            next_check_at: время следующей проверки
+            score: оценка целостности
+            error: сообщение об ошибке
+            fail_count_increment: на сколько увеличить счетчик неудач
+        
+        Returns:
+            True если переход выполнен успешно
+        """
+        from .metrics import get_metrics
+        path_str = str(Path(file_path).resolve())
+        current_time = int(datetime.now().timestamp())
+        metrics = get_metrics()
+        
+        with self._get_connection() as conn:
+            try:
+                # Атомарная проверка и обновление
+                if fail_count_increment > 0:
+                    cursor = conn.execute("""
+                        UPDATE files SET 
+                            integrity_status = ?,
+                            integrity_score = ?,
+                            last_error = ?,
+                            next_check_at = COALESCE(?, next_check_at),
+                            integrity_fail_count = integrity_fail_count + ?,
+                            updated_at = ?
+                        WHERE path = ? AND integrity_status = ?
+                    """, (
+                        to_status.value,
+                        score,
+                        error,
+                        next_check_at,
+                        fail_count_increment,
+                        current_time,
+                        path_str,
+                        from_status.value
+                    ))
+                else:
+                    cursor = conn.execute("""
+                        UPDATE files SET 
+                            integrity_status = ?,
+                            integrity_score = ?,
+                            last_error = ?,
+                            next_check_at = COALESCE(?, next_check_at),
+                            updated_at = ?
+                        WHERE path = ? AND integrity_status = ?
+                    """, (
+                        to_status.value,
+                        score,
+                        error,
+                        next_check_at,
+                        current_time,
+                        path_str,
+                        from_status.value
+                    ))
+                
+                success = cursor.rowcount > 0
+                if success:
+                    conn.commit()
+                    # Записываем метрику перехода
+                    metrics.increment(f"files_transitions_total", {
+                        'from': from_status.value,
+                        'to': to_status.value
+                    })
+                    logger.debug(f"Статус перешел {from_status.value} -> {to_status.value}: {Path(file_path).name}")
+                else:
+                    logger.warning(f"Не удался переход {from_status.value} -> {to_status.value}: {Path(file_path).name}")
+                
+                return success
+                
+            except Exception as e:
+                conn.rollback()
+                logger.error(f"Ошибка перехода статуса для {file_path}: {e}")
+                return False
 
     def get_due_files(self, current_time: Optional[int] = None, limit: int = 100) -> List[FileEntry]:
         """
-        Получение файлов, готовых к проверке
+        Получение файлов, готовых к проверке с учетом lease protection
         
         Args:
             current_time: текущее время (по умолчанию - сейчас)
@@ -527,20 +709,160 @@ class StateStore:
         if current_time is None:
             current_time = int(datetime.now().timestamp())
         
+        # Get current monotonic time for lease expiration check
+        from .time_provider import get_time_source
+        time_source = get_time_source()
+        current_mono = time_source.now_mono()
+        
         with self._get_connection() as conn:
             cursor = conn.execute("""
                 SELECT * FROM files 
                 WHERE next_check_at <= ? 
-                AND integrity_status != 'PENDING'
+                AND (
+                    integrity_status != 'PENDING' 
+                    OR (
+                        integrity_status = 'PENDING' 
+                        AND (
+                            pending_owner IS NULL 
+                            OR pending_expires_at IS NULL 
+                            OR pending_expires_at <= ?
+                        )
+                    )
+                )
                 ORDER BY next_check_at ASC
                 LIMIT ?
-            """, (current_time, limit))
+            """, (current_time, current_mono, limit))
             
             files = []
             for row in cursor.fetchall():
                 files.append(self._row_to_file_entry(row))
             
+            # Clean up any expired leases we found
+            if files:
+                expired_count = 0
+                for file_entry in files:
+                    if (file_entry.integrity_status == IntegrityStatus.PENDING and
+                        file_entry.pending_expires_at is not None and 
+                        file_entry.pending_expires_at <= current_mono):
+                        # This lease is expired, clean it up
+                        file_entry.pending_owner = None
+                        file_entry.pending_expires_at = None
+                        file_entry.integrity_status = IntegrityStatus.UNKNOWN
+                        expired_count += 1
+                
+                if expired_count > 0:
+                    logger.debug(f"Found {expired_count} expired leases in due files query")
+            
             return files
+
+    def find_file_by_identity(self, device: Optional[int] = None, 
+                             inode: Optional[int] = None, 
+                             identity: Optional[str] = None) -> Optional[FileEntry]:
+        """
+        Find file by its identity (device/inode or fallback identity)
+        
+        Args:
+            device: Device ID (POSIX)
+            inode: Inode number (POSIX)
+            identity: Fallback identity string
+            
+        Returns:
+            FileEntry if found, None otherwise
+        """
+        with self._get_connection() as conn:
+            if device is not None and inode is not None:
+                # Use device/inode for POSIX
+                cursor = conn.execute("""
+                    SELECT * FROM files 
+                    WHERE file_device = ? AND file_inode = ?
+                    LIMIT 1
+                """, (device, inode))
+            elif identity is not None:
+                # Use fallback identity
+                cursor = conn.execute("""
+                    SELECT * FROM files 
+                    WHERE file_identity = ?
+                    LIMIT 1
+                """, (identity,))
+            else:
+                return None
+            
+            row = cursor.fetchone()
+            return self._row_to_file_entry(row) if row else None
+
+    def handle_rename(self, old_path: str, new_path: str) -> Optional[FileEntry]:
+        """
+        Handle file rename - update path while preserving identity and state
+        
+        Args:
+            old_path: Previous file path
+            new_path: New file path
+            
+        Returns:
+            Updated FileEntry if successful, None if file not found
+        """
+        from .models import normalize_group_id, get_file_identity
+        
+        # Get identity of new path
+        new_device, new_inode, new_identity = get_file_identity(new_path)
+        
+        # Try to find existing entry by identity first
+        existing_entry = None
+        if new_device is not None and new_inode is not None:
+            existing_entry = self.find_file_by_identity(device=new_device, inode=new_inode)
+        elif new_identity is not None:
+            existing_entry = self.find_file_by_identity(identity=new_identity)
+        
+        # If not found by identity, try to find by old path
+        if existing_entry is None:
+            existing_entry = self.get_file(old_path)
+        
+        if existing_entry is None:
+            logger.warning(f"Could not find file to rename from {old_path} to {new_path}")
+            return None
+        
+        # Update the entry with new path and group_id
+        new_group_id, new_is_stereo = normalize_group_id(new_path)
+        
+        with self._get_connection() as conn:
+            try:
+                # Update the file record - preserving all state except path-related fields
+                # Per task requirements: "stability windows follow identity, not path"
+                cursor = conn.execute("""
+                    UPDATE files 
+                    SET path = ?,
+                        group_id = ?,
+                        is_stereo = ?,
+                        file_device = ?,
+                        file_inode = ?,
+                        file_identity = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                """, (
+                    new_path, 
+                    new_group_id, 
+                    int(new_is_stereo),
+                    new_device,
+                    new_inode, 
+                    new_identity,
+                    int(datetime.now().timestamp()),
+                    existing_entry.id
+                ))
+                
+                if cursor.rowcount == 0:
+                    logger.error(f"Failed to update file record for rename {old_path} -> {new_path}")
+                    return None
+                
+                conn.commit()
+                logger.info(f"File renamed: {old_path} -> {new_path} (ID: {existing_entry.id})")
+                
+                # Return updated entry
+                return self.get_file(new_path)
+                
+            except Exception as e:
+                logger.error(f"Error handling rename {old_path} -> {new_path}: {e}")
+                conn.rollback()
+                return None
     
     def get_quarantined_files_count(self, current_time: Optional[int] = None) -> int:
         """
@@ -873,6 +1195,164 @@ class StateStore:
         except Exception as e:
             logger.error(f"Ошибка оптимизации БД: {e}")
             return False
+
+    # === Lease Management Methods ===
+
+    @classmethod
+    def _get_worker_id(cls) -> str:
+        """Generate a unique worker ID for lease ownership"""
+        if cls._worker_id_cache is None:
+            # Use process ID + thread ID + random UUID for uniqueness
+            pid = os.getpid()
+            tid = threading.get_ident()
+            uid = str(uuid.uuid4())[:8]
+            cls._worker_id_cache = f"worker-{pid}-{tid}-{uid}"
+        return cls._worker_id_cache
+
+    def acquire_lease(self, file_entry: FileEntry, lease_timeout_seconds: Optional[float] = None) -> bool:
+        """
+        Acquire a lease for PENDING protection
+        
+        Args:
+            file_entry: FileEntry to acquire lease for
+            lease_timeout_seconds: Custom lease timeout (default: LEASE_TIMEOUT_SECONDS)
+            
+        Returns:
+            True if lease acquired successfully, False otherwise
+        """
+        if lease_timeout_seconds is None:
+            lease_timeout_seconds = self.LEASE_TIMEOUT_SECONDS
+            
+        worker_id = self._get_worker_id()
+        
+        # Use monotonic time for lease expiration to avoid clock changes
+        from .time_provider import get_time_source
+        time_source = get_time_source()
+        expires_at = time_source.now_mono() + lease_timeout_seconds
+        
+        with self._get_connection() as conn:
+            try:
+                # Atomically acquire lease only if no active lease exists
+                cursor = conn.execute("""
+                    UPDATE files 
+                    SET pending_owner = ?, 
+                        pending_expires_at = ?,
+                        integrity_status = 'PENDING',
+                        updated_at = ?
+                    WHERE id = ? 
+                    AND (pending_owner IS NULL 
+                         OR pending_expires_at IS NULL 
+                         OR pending_expires_at <= ?)
+                """, (
+                    worker_id,
+                    expires_at, 
+                    int(time_source.now_wall()),
+                    file_entry.id,
+                    time_source.now_mono()  # Current time for expiration check
+                ))
+                
+                conn.commit()
+                success = cursor.rowcount > 0
+                
+                if success:
+                    # Update the FileEntry object
+                    file_entry.pending_owner = worker_id
+                    file_entry.pending_expires_at = expires_at
+                    file_entry.integrity_status = IntegrityStatus.PENDING
+                    logger.debug(f"Acquired lease for file {file_entry.path} (worker: {worker_id})")
+                else:
+                    logger.debug(f"Failed to acquire lease for file {file_entry.path} (already leased)")
+                
+                return success
+                
+            except sqlite3.Error as e:
+                conn.rollback()
+                logger.error(f"Error acquiring lease for file {file_entry.path}: {e}")
+                return False
+
+    def release_lease(self, file_entry: FileEntry, new_integrity_status: IntegrityStatus = IntegrityStatus.UNKNOWN) -> bool:
+        """
+        Release a lease and update integrity status
+        
+        Args:
+            file_entry: FileEntry to release lease for  
+            new_integrity_status: New integrity status after processing
+            
+        Returns:
+            True if lease released successfully, False otherwise
+        """
+        worker_id = self._get_worker_id()
+        
+        with self._get_connection() as conn:
+            try:
+                # Only release if we own the lease
+                cursor = conn.execute("""
+                    UPDATE files 
+                    SET pending_owner = NULL,
+                        pending_expires_at = NULL,
+                        integrity_status = ?,
+                        updated_at = ?
+                    WHERE id = ? AND pending_owner = ?
+                """, (
+                    new_integrity_status.value,
+                    int(datetime.now().timestamp()),
+                    file_entry.id,
+                    worker_id
+                ))
+                
+                conn.commit()
+                success = cursor.rowcount > 0
+                
+                if success:
+                    # Update the FileEntry object
+                    file_entry.pending_owner = None
+                    file_entry.pending_expires_at = None
+                    file_entry.integrity_status = new_integrity_status
+                    logger.debug(f"Released lease for file {file_entry.path} (worker: {worker_id})")
+                else:
+                    logger.warning(f"Failed to release lease for file {file_entry.path} (not owned by {worker_id})")
+                
+                return success
+                
+            except sqlite3.Error as e:
+                conn.rollback()
+                logger.error(f"Error releasing lease for file {file_entry.path}: {e}")
+                return False
+
+    def cleanup_expired_leases(self) -> int:
+        """
+        Clean up expired leases
+        
+        Returns:
+            Number of expired leases cleaned up
+        """
+        from .time_provider import get_time_source
+        time_source = get_time_source()
+        current_mono = time_source.now_mono()
+        
+        with self._get_connection() as conn:
+            try:
+                cursor = conn.execute("""
+                    UPDATE files 
+                    SET pending_owner = NULL,
+                        pending_expires_at = NULL,
+                        integrity_status = 'UNKNOWN'
+                    WHERE pending_expires_at IS NOT NULL 
+                    AND pending_expires_at <= ?
+                """, (current_mono,))
+                
+                conn.commit()
+                count = cursor.rowcount
+                
+                if count > 0:
+                    logger.info(f"Cleaned up {count} expired leases")
+                
+                return count
+                
+            except sqlite3.Error as e:
+                conn.rollback()
+                logger.error(f"Error cleaning up expired leases: {e}")
+                return 0
 
     def close(self):
         """Закрытие хранилища"""

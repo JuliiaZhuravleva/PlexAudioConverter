@@ -70,6 +70,7 @@ class StatePlanner:
             'stable_wait_sec': 30,
             'backoff_step_sec': 30,
             'backoff_max_sec': 600,
+            'quarantine_threshold': 5,
             'batch_size': 50,
             'loop_interval_sec': 5,
             'integrity_timeout_sec': 300,
@@ -116,11 +117,33 @@ class StatePlanner:
             # Получаем статистику через StatProvider
             file_stats = self.stat_provider.stat(file_path)
             
-            # Проверяем, существует ли файл в хранилище
-            existing = self.store.get_file(file_path)
+            # First check if this file identity already exists (rename detection)
+            from .models import get_file_identity
+            device, inode, identity = get_file_identity(file_path)
+            existing_by_identity = None
+            if device is not None and inode is not None:
+                existing_by_identity = self.store.find_file_by_identity(device=device, inode=inode)
+            elif identity is not None:
+                existing_by_identity = self.store.find_file_by_identity(identity=identity)
             
-            if existing is None:
-                # Создаем новую запись
+            # Check if file exists at current path
+            existing_by_path = self.store.get_file(file_path)
+            
+            if existing_by_identity and existing_by_identity.path != str(file_path):
+                # This is a rename! Handle it
+                logger.info(f"Rename detected: {existing_by_identity.path} -> {file_path}")
+                entry = self.store.handle_rename(existing_by_identity.path, str(file_path))
+                if entry:
+                    # Update group presence for the new group_id
+                    if entry.group_id:
+                        await self.update_group_presence(entry.group_id, delete_original)
+                    return entry
+                else:
+                    logger.error(f"Failed to handle rename for {file_path}")
+                    # Fall through to create new entry
+            
+            if existing_by_path is None:
+                # Create new entry (or recreate after failed rename)
                 entry = create_file_entry_from_path(file_path, delete_original)
                 # Инициализируем monotonic time для нового файла
                 entry.last_change_at = self.time_source.now_mono()
@@ -130,7 +153,7 @@ class StatePlanner:
                 logger.info(f"Обнаружен новый файл: {file_path.name} (ID: {entry.id})")
             else:
                 # Обновляем существующую запись с новой статистикой
-                entry = existing
+                entry = existing_by_path
                 changed = entry.update_file_stats(
                     file_stats.size, 
                     file_stats.mtime,
@@ -221,19 +244,21 @@ class StatePlanner:
         current_time = int(datetime.now().timestamp())
         
         # Проверяем существование файла
-        if not file_path.exists():
+        if not self.stat_provider.exists(file_path):
             logger.debug(f"Файл не существует, планируем очистку: {entry.path}")
             return PlannerAction.CLEANUP_MISSING
         
+        # Получаем статистику файла
+        file_stats = self.stat_provider.stat(file_path)
+        
         # Проверяем изменения размера/времени
-        stat = file_path.stat()
-        if entry.size_bytes != stat.st_size or entry.mtime != int(stat.st_mtime):
+        if entry.size_bytes != file_stats.size or entry.mtime != file_stats.mtime:
             logger.debug(f"Файл изменился, обновляем статистику: {file_path.name}")
             return PlannerAction.CHECK_SIZE_STABILITY
         
-        # Проверяем стабильность
+        # Проверяем стабильность для новых файлов
         if entry.stable_since is None:
-            if current_time - entry.mtime >= 1:  # файл не менялся минимум 1 секунду
+            if (current_time - entry.mtime) >= 1:  # файл не менялся минимум 1 секунду
                 logger.debug(f"Отмечаем файл как стабильный: {file_path.name}")
                 return PlannerAction.CHECK_SIZE_STABILITY
             else:
@@ -243,16 +268,21 @@ class StatePlanner:
                 return None
         
         # Проверяем готовность к integrity-проверке
-        if not entry.is_stable(self.config['stable_wait_sec']):
+        stable_elapsed = current_time - entry.stable_since if entry.stable_since else 0
+        if stable_elapsed < self.config['stable_wait_sec']:
             defer_time = entry.stable_since + self.config['stable_wait_sec']
             entry.next_check_at = defer_time
             self.store.upsert_file(entry)
-            logger.debug(f"Файл еще не готов к проверке целостности: {file_path.name}")
+            logger.debug(f"Файл еще не готов к проверке целостности: {file_path.name} (осталось {self.config['stable_wait_sec'] - stable_elapsed}s)")
             return None
         
-        # Проверка целостности
-        if entry.integrity_status in {IntegrityStatus.UNKNOWN, IntegrityStatus.INCOMPLETE, IntegrityStatus.ERROR}:
-            logger.debug(f"Планируем проверку целостности: {file_path.name}")
+        # Проверка целостности для файлов в состояниях, требующих проверки
+        if entry.integrity_status == IntegrityStatus.UNKNOWN:
+            logger.debug(f"Планируем проверку целостности: {file_path.name} (UNKNOWN)")
+            return PlannerAction.CHECK_INTEGRITY
+        elif entry.integrity_status in {IntegrityStatus.INCOMPLETE, IntegrityStatus.ERROR}:
+            # Файлы в карантине проверяются по расписанию backoff
+            logger.debug(f"Планируем повторную проверку целостности: {file_path.name} ({entry.integrity_status.value})")
             return PlannerAction.CHECK_INTEGRITY
         
         # Анализ аудио после успешной проверки целостности
@@ -357,6 +387,9 @@ class StatePlanner:
             if elapsed_stable >= self.config['stable_wait_sec']:
                 # Файл готов к integrity проверке
                 entry.next_check_at = current_wall
+                # Также устанавливаем legacy stable_since для совместимости
+                if entry.stable_since is None:
+                    entry.stable_since = current_wall - self.config['stable_wait_sec']
                 metrics.increment(MetricNames.STABILITY_TRIGGERED, {'path': file_path.name})
             else:
                 # Откладываем до готовности
@@ -393,6 +426,22 @@ class StatePlanner:
         metrics = get_metrics()
         current_time = int(self.time_source.now_wall())
         
+        # Check if file should be quarantined (Task 5)
+        if entry.integrity_fail_count >= self.config['quarantine_threshold']:
+            from .enums import IntegrityStatus
+            entry.integrity_status = IntegrityStatus.QUARANTINED
+            entry.next_check_at = int(self.time_source.now_wall()) + 365 * 24 * 3600  # Far future
+            self.store.upsert_file(entry)
+            
+            metrics.increment(MetricNames.QUARANTINED_TOTAL, {'reason': reason})
+            logger.warning(
+                f"File QUARANTINED: path={Path(entry.path).name}, "
+                f"fail_count={entry.integrity_fail_count}, "
+                f"threshold={self.config['quarantine_threshold']}, "
+                f"reason={reason}"
+            )
+            return
+        
         # Определяем, первый ли это backoff для этого файла
         is_first_backoff = entry.integrity_fail_count <= 1
         
@@ -402,6 +451,9 @@ class StatePlanner:
         else:
             metrics.increment(MetricNames.BACKOFF_RESUMED, {'reason': reason})
             metrics.increment(MetricNames.INTEGRITY_BACKOFF_RESUMED, {'reason': reason})
+        
+        # Track retry metric (Task 5)
+        metrics.increment(MetricNames.PENDING_RETRIES_TOTAL, {'reason': reason, 'fail_count': str(entry.integrity_fail_count)})
         
         # Линейный backoff с ограничением: step, 2*step, 3*step, ..., max
         backoff_multiplier = min(

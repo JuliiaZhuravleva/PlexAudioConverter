@@ -481,10 +481,16 @@ def create_test_config_manager(**overrides):
 
 def create_sample_video_file(path: Path, size_mb: int = 100) -> Path:
     """Создать образец видео файла для тестов"""
+    import hashlib
+    
     path.parent.mkdir(parents=True, exist_ok=True)
     
-    # Создать файл с псевдо-видео содержимым
-    content = b'FAKE_VIDEO_HEADER' + b'\x00' * (size_mb * 1024 * 1024 - 17)
+    # Создать файл с уникальным псевдо-видео содержимым на основе имени файла
+    # This ensures different files have different identities
+    path_hash = hashlib.md5(str(path).encode('utf-8')).hexdigest()[:16].encode('ascii')
+    header = b'FAKE_VIDEO_' + path_hash + b'_'
+    padding_size = max(0, size_mb * 1024 * 1024 - len(header))
+    content = header + b'\x00' * padding_size
     path.write_bytes(content)
     
     return path

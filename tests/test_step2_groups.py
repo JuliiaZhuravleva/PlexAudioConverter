@@ -33,7 +33,7 @@ class TestGroupsAndEN20Logic:
             monitor = AudioMonitor(
                 config=config,
                 state_store=test_store.store,
-                state_planner=test_store.store
+                state_planner=test_store.planner
             )
             
             # Discovery обоих файлов
@@ -83,18 +83,19 @@ class TestGroupsAndEN20Logic:
             fake_integrity = FakeIntegrityChecker()
             fake_integrity.delay_seconds = 0.1
             
-            with patch('core.video_integrity_checker.VideoIntegrityChecker') as mock_checker, \
-                 patch('core.audio_monitor.get_audio_streams') as mock_ffprobe:
+            with patch('core.audio_monitor.get_audio_streams') as mock_ffprobe:
                 
-                mock_checker.return_value.check_video_integrity = fake_integrity.check_video_integrity
                 mock_ffprobe.return_value = ffprobe_stub.get_audio_streams(str(video_file))
                 
                 config = create_test_config_manager()
                 monitor = AudioMonitor(
                     config=config,
                     state_store=test_store.store,
-                    state_planner=test_store.store
+                    state_planner=test_store.planner
                 )
+                
+                # Patch the integrity checker instance after AudioMonitor creation
+                monitor.integrity_checker.check_video_integrity = fake_integrity.check_video_integrity
                 
                 # Discovery и стабилизация
                 monitor.scan_directory(str(temp_dir))
@@ -137,7 +138,7 @@ class TestGroupsAndEN20Logic:
             monitor = AudioMonitor(
                 config=config,
                 state_store=test_store.store,
-                state_planner=test_store.store
+                state_planner=test_store.planner
             )
             
             # Discovery всех файлов
@@ -172,7 +173,7 @@ class TestGroupsAndEN20Logic:
             monitor = AudioMonitor(
                 config=config,
                 state_store=test_store.store,
-                state_planner=test_store.store
+                state_planner=test_store.planner
             )
             
             # Discovery
@@ -206,7 +207,7 @@ class TestGroupsAndEN20Logic:
             monitor = AudioMonitor(
                 config=config,
                 state_store=test_store.store,
-                state_planner=test_store.store
+                state_planner=test_store.planner
             )
             
             # Discovery
@@ -239,7 +240,7 @@ class TestGroupsAndEN20Logic:
             monitor = AudioMonitor(
                 config=config,
                 state_store=test_store.store,
-                state_planner=test_store.store
+                state_planner=test_store.planner
             )
             
             # Сначала создать только original
@@ -287,7 +288,7 @@ class TestGroupsAndEN20Logic:
             monitor = AudioMonitor(
                 config=config,
                 state_store=test_store.store,
-                state_planner=test_store.store
+                state_planner=test_store.planner
             )
             
             # Создать все файлы
@@ -344,7 +345,7 @@ class TestGroupsAndEN20Logic:
                     monitor = AudioMonitor(
                         config=config,
                         state_store=test_store.store,
-                        state_planner=test_store.store
+                        state_planner=test_store.planner
                     )
                     
                     # В Step 2 проверяем что EN 2.0 детектируется но не влияет на обработку
