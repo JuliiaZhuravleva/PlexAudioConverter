@@ -93,11 +93,11 @@ def test_download_monitor_integration():
         monitor.add_file(test_file)
         
         # Получаем информацию о файле
-        file_info = monitor.get_file_info(test_file)
+        file_info = monitor.get_file_status(test_file)
         if file_info:
             print(f"Статус файла: {file_info.status.value}")
             print(f"Метод детекции: {file_info.detection_method}")
-            print(f"Размер: {file_info.current_size / (1024*1024):.1f} MB")
+            print(f"Размер: {file_info.size / (1024*1024):.1f} MB")
             print(f"Стабильность: {file_info.stable_duration:.1f} сек")
         else:
             print("Не удалось получить информацию о файле")

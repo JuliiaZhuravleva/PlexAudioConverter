@@ -13,7 +13,7 @@ from tests.fixtures import (
     create_test_config, create_sample_video_file
 )
 from state_management.enums import IntegrityStatus, ProcessedStatus
-from state_management.manager import create_state_manager
+from state_management.manager import create_state_manager, StateManager
 from state_management.models import FileEntry
 
 
@@ -106,7 +106,7 @@ class TestDirectStateManagement:
             clock.advance(6)  # More than stable_wait_sec
             
             # Trigger stability check
-            test_store.store.check_stability_and_schedule(str(video_file))
+            test_store.store.check_stability_and_schedule(str(video_file), stable_wait_sec=5)
             
             # File should now be marked as stable and due for integrity check
             updated_data = test_store.get_file_by_path(str(video_file))
@@ -174,7 +174,11 @@ class TestDirectStateManagement:
             batch_2 = test_store.store.get_due_files(limit=3)
             assert len(batch_2) == 2
             
-            # Third batch: should be empty
+            # Mark second batch as PENDING too
+            for file_entry in batch_2:
+                test_store.store.set_integrity_status(file_entry.path, IntegrityStatus.PENDING)
+            
+            # Third batch: should be empty (all files are now PENDING)
             batch_3 = test_store.store.get_due_files(limit=3)
             assert len(batch_3) == 0
 
