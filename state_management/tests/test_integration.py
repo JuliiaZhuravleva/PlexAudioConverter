@@ -285,6 +285,57 @@ class TestStatePlanner:
         # Так как файл не существует, он должен быть удален
         assert processed_count >= 0  # может быть 0 если не удалось обработать
 
+    @pytest.mark.asyncio 
+    async def test_failed_task_backoff(self, temp_planner):
+        """Тест применения backoff при неуспешном выполнении задачи"""
+        planner, store = temp_planner
+        
+        # Создаем реальный временный файл 
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.mkv', delete=False) as tmp_file:
+            tmp_file.write("fake video content")
+            tmp_file_path = tmp_file.name
+        
+        try:
+            current_time = int(time.time())
+            file_stats = Path(tmp_file_path).stat()
+            
+            # Создаем файл с статусом INCOMPLETE (будет планировать CHECK_INTEGRITY)
+            entry = FileEntry(
+                path=tmp_file_path, 
+                group_id="test_group",
+                next_check_at=current_time - 100,  # просрочен
+                size_bytes=file_stats.st_size,
+                mtime=int(file_stats.st_mtime),
+                integrity_status=IntegrityStatus.INCOMPLETE,
+                stable_since=current_time - 200
+            )
+            
+            store.upsert_file(entry)
+            
+            # Получаем файл до обработки
+            before_entry = store.get_file(entry.path)
+            assert before_entry.next_check_at < current_time
+            original_fail_count = before_entry.integrity_fail_count
+            
+            # Обрабатываем - должен применить backoff для неуспешной CHECK_INTEGRITY задачи
+            processed_count = await planner.process_due_files(limit=1)
+            
+            # processed_count должен быть 0, т.к. задача выполнена неуспешно
+            assert processed_count == 0  # неуспешная задача не считается обработанной
+            
+            # Проверяем что backoff применен: next_check_at обновлен в будущее
+            after_entry = store.get_file(entry.path) 
+            assert after_entry is not None, f"File entry should not be deleted: {entry.path}"
+            assert after_entry.next_check_at > current_time, f"Expected next_check_at > {current_time}, got {after_entry.next_check_at}"
+            assert after_entry.integrity_fail_count > original_fail_count, "Fail count should increase"
+            
+        finally:
+            # Очистка временного файла
+            try:
+                Path(tmp_file_path).unlink()
+            except:
+                pass
+
 
 @pytest.fixture
 def temp_video_files():

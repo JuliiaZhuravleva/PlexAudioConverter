@@ -214,6 +214,9 @@ class StatePlanner:
                     success = await self._execute_task(task)
                     if success:
                         processed_count += 1
+                    else:
+                        # Если задача не выполнена успешно, применяем backoff
+                        await self.apply_backoff(file_entry)
                     
             except Exception as e:
                 logger.error(f"Ошибка обработки файла {file_entry.path}: {e}")
@@ -425,6 +428,9 @@ class StatePlanner:
         """
         metrics = get_metrics()
         current_time = int(self.time_source.now_wall())
+        
+        # Увеличиваем счетчик неудач перед проверкой карантина
+        entry.integrity_fail_count += 1
         
         # Check if file should be quarantined (Task 5)
         if entry.integrity_fail_count >= self.config['quarantine_threshold']:
