@@ -50,7 +50,26 @@ class DiscoveryAdapter:
         path_obj = Path(path)
         
         if path_obj.is_file():
-            return asyncio.run(self._discover_file(path_obj))
+            # Use the same async handling pattern as discover_directory
+            try:
+                loop = asyncio.get_running_loop()
+                import threading
+                import concurrent.futures
+                
+                def run_in_new_loop():
+                    new_loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(new_loop)
+                    try:
+                        return new_loop.run_until_complete(self._discover_file(path_obj))
+                    finally:
+                        new_loop.close()
+                
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(run_in_new_loop)
+                    return future.result()
+                    
+            except RuntimeError:
+                return asyncio.run(self._discover_file(path_obj))
         elif path_obj.is_dir():
             return self.discover_directory(path_obj)
         else:
@@ -75,10 +94,35 @@ class DiscoveryAdapter:
             return {'files_added': 0, 'files_updated': 0, 'error': 'Directory not found'}
         
         try:
-            # Вызываем async метод через event loop
-            new_files_count = asyncio.run(
-                self.planner.scan_directory(directory_path, delete_original)
-            )
+            # Проверяем, находимся ли мы в async контексте
+            try:
+                loop = asyncio.get_running_loop()
+                # Если мы здесь, то уже в async контексте - не можем использовать asyncio.run()
+                # Создаем новый event loop в отдельном потоке
+                import threading
+                import concurrent.futures
+                
+                def run_in_new_loop():
+                    # Создаем новый event loop для этого потока
+                    new_loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(new_loop)
+                    try:
+                        return new_loop.run_until_complete(
+                            self.planner.scan_directory(directory_path, delete_original)
+                        )
+                    finally:
+                        new_loop.close()
+                
+                # Выполняем в отдельном потоке с новым event loop
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(run_in_new_loop)
+                    new_files_count = future.result()
+                    
+            except RuntimeError:
+                # Нет активного event loop - можем использовать asyncio.run()
+                new_files_count = asyncio.run(
+                    self.planner.scan_directory(directory_path, delete_original)
+                )
             
             return {
                 'files_added': new_files_count,

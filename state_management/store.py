@@ -329,7 +329,8 @@ class StateStore:
 
     def get_file(self, path: Union[str, Path]) -> Optional[FileEntry]:
         """Получение файла по пути"""
-        path_str = str(Path(path).resolve())
+        from .platform_utils import normalize_path_for_comparison
+        path_str = normalize_path_for_comparison(path)
         
         with self._get_connection() as conn:
             cursor = conn.execute(
@@ -373,9 +374,14 @@ class StateStore:
         # Backward compatibility: if called with kwargs instead of FileEntry
         if entry is None and kwargs:
             from .models import normalize_group_id
+            from .platform_utils import normalize_path_for_storage
+            
+            # Normalize the path first
+            file_path = kwargs.get('path')
+            if file_path:
+                kwargs['path'] = normalize_path_for_storage(file_path)
             
             # Auto-generate group_id if not provided
-            file_path = kwargs.get('path')
             if file_path and 'group_id' not in kwargs:
                 group_id, is_stereo_detected = normalize_group_id(file_path)
                 kwargs['group_id'] = group_id
@@ -408,6 +414,7 @@ class StateStore:
         elif entry is None:
             raise ValueError("Either 'entry' parameter or keyword arguments must be provided")
             
+        
         # Now proceed with the original logic
         with self._get_connection() as conn:
             try:
@@ -802,6 +809,11 @@ class StateStore:
             Updated FileEntry if successful, None if file not found
         """
         from .models import normalize_group_id, get_file_identity
+        from .platform_utils import normalize_path_for_storage
+        
+        # Normalize both paths
+        old_path_norm = normalize_path_for_storage(old_path)
+        new_path_norm = normalize_path_for_storage(new_path)
         
         # Get identity of new path
         new_device, new_inode, new_identity = get_file_identity(new_path)
@@ -815,7 +827,7 @@ class StateStore:
         
         # If not found by identity, try to find by old path
         if existing_entry is None:
-            existing_entry = self.get_file(old_path)
+            existing_entry = self.get_file(old_path_norm)
         
         if existing_entry is None:
             logger.warning(f"Could not find file to rename from {old_path} to {new_path}")
@@ -839,7 +851,7 @@ class StateStore:
                         updated_at = ?
                     WHERE id = ?
                 """, (
-                    new_path, 
+                    new_path_norm, 
                     new_group_id, 
                     int(new_is_stereo),
                     new_device,
@@ -857,7 +869,7 @@ class StateStore:
                 logger.info(f"File renamed: {old_path} -> {new_path} (ID: {existing_entry.id})")
                 
                 # Return updated entry
-                return self.get_file(new_path)
+                return self.get_file(new_path_norm)
                 
             except Exception as e:
                 logger.error(f"Error handling rename {old_path} -> {new_path}: {e}")

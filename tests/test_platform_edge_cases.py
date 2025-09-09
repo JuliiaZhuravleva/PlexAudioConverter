@@ -86,6 +86,11 @@ class TestPlatformEdgeCases:
     def test_t502_case_sensitivity(self):
         """T-502: Case sensitivity"""
         with TempFS() as temp_dir, StateStoreFixture() as test_store:
+            from state_management.platform_utils import filesystem_is_case_sensitive
+            
+            # Check filesystem case sensitivity
+            is_case_sensitive = filesystem_is_case_sensitive(temp_dir)
+            
             # Создать файлы с разным регистром
             case_pairs = [
                 ("Movie.MKV", "movie.mkv"),
@@ -93,21 +98,27 @@ class TestPlatformEdgeCases:
             ]
             
             created_files = []
+            expected_unique_files = 0
+            
             for upper_name, lower_name in case_pairs:
                 upper_path = temp_dir / upper_name
                 lower_path = temp_dir / lower_name
                 
-                # На case-sensitive системах оба файла могут существовать
-                # На case-insensitive системах второй файл перезапишет первый
-                try:
-                    create_sample_video_file(upper_path, size_mb=10)
+                # Create the first file
+                create_sample_video_file(upper_path, size_mb=10)
+                
+                if is_case_sensitive:
+                    # On case-sensitive systems, both files can exist
                     created_files.append(upper_path)
-                    
                     create_sample_video_file(lower_path, size_mb=15)
                     created_files.append(lower_path)
-                except FileExistsError:
-                    # Case-insensitive filesystem
-                    created_files.append(lower_path)  # Only the last one survives
+                    expected_unique_files += 2
+                else:
+                    # On case-insensitive systems, second file overwrites first
+                    create_sample_video_file(lower_path, size_mb=15)
+                    # Both paths refer to the same file, but we'll keep track of both
+                    created_files.extend([upper_path, lower_path])
+                    expected_unique_files += 1  # Only 1 unique file per pair
             
             fake_integrity = FakeIntegrityChecker()
             fake_integrity.delay_seconds = 0
@@ -127,25 +138,20 @@ class TestPlatformEdgeCases:
                 
                 # Проверить что поведение согласовано с ОС
                 files_in_db = test_store.get_file_count()
-                actual_files = len([f for f in created_files if f.exists()])
-                assert files_in_db == actual_files
+                
+                # On case-insensitive systems, database should have the same number as unique files
+                # On case-sensitive systems, database should match the actual file count
+                assert files_in_db == expected_unique_files, f"Expected {expected_unique_files} files in DB, got {files_in_db}. Case sensitive: {is_case_sensitive}"
                 
                 # Проверить что group_id не коллидируют неожиданно
                 all_group_ids = set()
-                for file_path in created_files:
-                    if file_path.exists():
-                        file_data = test_store.get_file_by_path(str(file_path))
-                        if file_data:
-                            all_group_ids.add(file_data['group_id'])
+                all_files_in_db = test_store.get_files_by_status()  # Get all files
                 
-                # На case-sensitive системах group_id должны быть разными
-                # На case-insensitive системах может быть один group_id
-                if sys.platform.startswith('linux'):
-                    # Linux обычно case-sensitive
-                    assert len(all_group_ids) >= len(created_files) // 2
-                else:
-                    # Windows/macOS могут быть case-insensitive
-                    assert len(all_group_ids) >= 1
+                for file_dict in all_files_in_db:
+                    all_group_ids.add(file_dict['group_id'])
+                
+                # Should have the expected number of unique group_ids
+                assert len(all_group_ids) == expected_unique_files, f"Expected {expected_unique_files} unique group_ids, got {len(all_group_ids)}"
 
     @pytest.mark.platform
     @pytest.mark.unix
@@ -270,19 +276,19 @@ class TestPlatformEdgeCases:
             create_sample_video_file(large_file, size_mb=100)  # Base size
             
             # Эмулируем что файл "большой" через FakeIntegrityChecker
+            config = create_test_config_manager()
+            monitor = AudioMonitor(
+                config=config,
+                state_store=test_store.store,
+                state_planner=test_store.planner
+            )
+            
             fake_integrity = FakeIntegrityChecker()
             fake_integrity.delay_seconds = 1  # Longer check for "large" files
             fake_integrity.enable_auto_mode(threshold_bytes=50 * 1024 * 1024)  # 50MB threshold
             
-            with patch('core.video_integrity_checker.VideoIntegrityChecker') as mock_checker:
-                mock_checker.return_value.check_video_integrity = fake_integrity.check_video_integrity
-                
-                config = create_test_config_manager()
-                monitor = AudioMonitor(
-                    config=config,
-                    state_store=test_store.store,
-                    state_planner=test_store.planner
-                )
+            # Mock the actual integrity checker instance in the monitor
+            with patch.object(monitor.integrity_checker, 'check_video_integrity', fake_integrity.check_video_integrity):
                 
                 # Discovery
                 monitor.scan_directory(str(temp_dir))

@@ -70,8 +70,9 @@ class FileEntry:
         if not self.path:
             raise ValueError("path не может быть пустым")
         
-        # Нормализуем путь
-        self.path = str(Path(self.path).resolve())
+        # Нормализуем путь с учетом платформозависимости  
+        from .platform_utils import normalize_path_for_storage
+        self.path = normalize_path_for_storage(self.path)
         
         # Валидация диапазонов
         if self.integrity_score is not None:
@@ -468,8 +469,10 @@ def create_file_entry_from_path(file_path: Union[str, Path],
     group_id, is_stereo = normalize_group_id(path)
     device, inode, identity = get_file_identity(path)
     
+    from .platform_utils import normalize_path_for_storage
+    
     entry = FileEntry(
-        path=str(path),
+        path=str(path),  # __post_init__ will handle normalization
         group_id=group_id,
         is_stereo=is_stereo,
         size_bytes=stat.st_size,

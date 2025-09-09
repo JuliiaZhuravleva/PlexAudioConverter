@@ -308,9 +308,13 @@ class StateStoreFixture:
     
     def get_file_by_path(self, path: str) -> Optional[Dict]:
         """Получить файл по пути"""
+        # Use the same normalization as the main store
+        from state_management.platform_utils import normalize_path_for_comparison
+        normalized_path = normalize_path_for_comparison(path)
+        
         with self.store._get_connection() as conn:
             cursor = conn.execute(
-                "SELECT * FROM files WHERE path = ?", (path,)
+                "SELECT * FROM files WHERE path = ?", (normalized_path,)
             )
             row = cursor.fetchone()
             if row:
